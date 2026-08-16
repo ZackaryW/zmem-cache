@@ -25,7 +25,7 @@ class ReleaseManifestTests(unittest.TestCase):
             path.write_bytes(f"artifact-{index}".encode())
             artifacts[target] = path
             identities[target] = {
-                "release_version": "0.1.0",
+                "release_version": "1.0.0",
                 "protocol_version": 2,
                 "schema_version": 2,
             }
@@ -33,7 +33,7 @@ class ReleaseManifestTests(unittest.TestCase):
 
     def test_complete_manifest_is_typed_and_canonical(self) -> None:
         artifacts, identities = self.inputs()
-        manifest = assemble_manifest("0.1.0", artifacts, identities)
+        manifest = assemble_manifest("1.0.0", artifacts, identities)
         self.assertEqual(manifest["manifest_version"], 1)
         self.assertEqual([asset["target"] for asset in manifest["assets"]], sorted(REQUIRED_TARGETS))
         rendered = render_manifest(manifest)
@@ -44,19 +44,19 @@ class ReleaseManifestTests(unittest.TestCase):
         artifacts, identities = self.inputs()
         artifacts.pop(next(iter(REQUIRED_TARGETS)))
         with self.assertRaisesRegex(ValueError, "target coverage"):
-            assemble_manifest("0.1.0", artifacts, identities)
+            assemble_manifest("1.0.0", artifacts, identities)
 
     def test_identity_is_strict_and_coherent(self) -> None:
         artifacts, identities = self.inputs()
         target = next(iter(REQUIRED_TARGETS))
         identities[target] = identities[target] | {"unknown": True}
         with self.assertRaisesRegex(ValueError, "unknown"):
-            assemble_manifest("0.1.0", artifacts, identities)
+            assemble_manifest("1.0.0", artifacts, identities)
 
         artifacts, identities = self.inputs()
         identities[target]["release_version"] = "0.2.0"
         with self.assertRaisesRegex(ValueError, "release version"):
-            assemble_manifest("0.1.0", artifacts, identities)
+            assemble_manifest("1.0.0", artifacts, identities)
 
     def test_asset_name_must_match_target(self) -> None:
         artifacts, identities = self.inputs()
@@ -65,7 +65,7 @@ class ReleaseManifestTests(unittest.TestCase):
         wrong.resolve().write_bytes(b"wrong")
         artifacts[target] = wrong.resolve()
         with self.assertRaisesRegex(ValueError, "asset name"):
-            assemble_manifest("0.1.0", artifacts, identities)
+            assemble_manifest("1.0.0", artifacts, identities)
 
 
 if __name__ == "__main__":
