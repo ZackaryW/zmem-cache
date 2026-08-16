@@ -1,0 +1,185 @@
+name: Release native service
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (for example, v1.2.3)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: macOS (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build and capture identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}" --package zmem-svc
+          mkdir -p dist
+          asset="zmem-svc-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/zmem-svc" "dist/${asset}"
+          chmod +x "dist/${asset}"
+          "dist/${asset}" version-json > "dist/${{ matrix.target }}.identity.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zmem-svc-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-windows:
+    name: Windows (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: i686-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build and capture identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build --release --locked --target "${{ matrix.target }}" --package zmem-svc
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $asset = "zmem-svc-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/zmem-svc.exe" "dist/$asset"
+          & "dist/$asset" version-json | Set-Content -Encoding utf8 "dist/${{ matrix.target }}.identity.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zmem-svc-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  build-linux:
+    name: Linux (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build and capture identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}" --package zmem-svc
+          mkdir -p dist
+          asset="zmem-svc-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/zmem-svc" "dist/${asset}"
+          chmod +x "dist/${asset}"
+          "dist/${asset}" version-json > "dist/${{ matrix.target }}.identity.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zmem-svc-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Validate and publish release
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Validate identities and assemble manifest
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            v*) version="${RELEASE_TAG#v}" ;;
+            *) echo "release tag must start with v" >&2; exit 2 ;;
+          esac
+          workspace_version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '[.packages[].version] | unique | if length == 1 then .[0] else error("workspace package versions disagree") end')"
+          test "$version" = "$workspace_version" || {
+            echo "release tag $RELEASE_TAG does not match workspace version $workspace_version" >&2
+            exit 2
+          }
+
+          mkdir dist
+          targets=(
+            aarch64-apple-darwin
+            aarch64-pc-windows-msvc
+            aarch64-unknown-linux-musl
+            i686-pc-windows-msvc
+            x86_64-apple-darwin
+            x86_64-pc-windows-msvc
+            x86_64-unknown-linux-musl
+          )
+          arguments=()
+          for target in "${targets[@]}"; do
+            source="artifacts/zmem-svc-${target}"
+            suffix=""
+            case "$target" in *-windows-msvc) suffix=".exe" ;; esac
+            asset="zmem-svc-${target}${suffix}"
+            cp "${source}/${asset}" "dist/${asset}"
+            cp "${source}/${target}.identity.json" "dist/${target}.identity.json"
+            arguments+=(--artifact "${target}=dist/${asset}")
+            arguments+=(--identity "${target}=dist/${target}.identity.json")
+          done
+          python scripts/release_manifest.py \
+            --version "$version" \
+            --output dist/release-manifest.json \
+            "${arguments[@]}"
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: |
+            dist/zmem-svc-*
+            dist/release-manifest.json
+          fail_on_unmatched_files: true
+          generate_release_notes: true
