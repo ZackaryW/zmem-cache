@@ -7,3 +7,8 @@ bin/target
 bin/*.ap_
 *.o
 *.jar
+
+# zmem-cache build and behavior-test outputs
+/target/
+/.venv/
+**/__pycache__/
