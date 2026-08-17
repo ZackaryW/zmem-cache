@@ -104,7 +104,7 @@ wheels = [
 
 [[package]]
 name = "zmem-cache-bdd"
-version = "1.0.0"
+version = "1.0.1"
 source = { virtual = "." }
 
 [package.dev-dependencies]

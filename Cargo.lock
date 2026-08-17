@@ -475,7 +475,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "zmem-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -484,7 +484,7 @@ dependencies = [
 
 [[package]]
 name = "zmem-store"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "zmem-svc"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
