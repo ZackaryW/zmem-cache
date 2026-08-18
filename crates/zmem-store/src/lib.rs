@@ -1,7 +1,7 @@
 //! SQLite storage and retention decisions.
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zmem_core::{Action, Anchor, HostResponse, SCHEMA_VERSION};
 
@@ -57,6 +57,13 @@ pub fn select_evictions(rows: &[Cohort], now: i64, policy: RetentionPolicy) -> E
 
 pub struct Store {
     connection: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectionRecord {
+    pub oid: String,
+    pub annotation_count: usize,
+    pub parser_diagnostics: Vec<String>,
 }
 
 pub struct CommitUpdate<'a> {
@@ -315,19 +322,25 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(path)?;
+        let mut connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
         let existing_version: u32 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if existing_version != 0 && existing_version != SCHEMA_VERSION {
-            connection.execute_batch(
-                "DROP TABLE IF EXISTS diagnostics;
-                 DROP TABLE IF EXISTS relationships;
-                 DROP TABLE IF EXISTS entries;
-                 DROP TABLE IF EXISTS commits;
-                 DROP TABLE IF EXISTS anchors;
-                 DROP TABLE IF EXISTS repositories;",
+        if existing_version == 2 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE inspections(
+                    commit_oid TEXT NOT NULL,
+                    parser_protocol INTEGER NOT NULL,
+                    annotation_count INTEGER NOT NULL,
+                    parser_diagnostics TEXT NOT NULL,
+                    PRIMARY KEY(commit_oid,parser_protocol)
+                 );
+                 PRAGMA user_version=3;",
             )?;
+            tx.commit()?;
+        } else if existing_version != 0 && existing_version != SCHEMA_VERSION {
+            anyhow::bail!("unsupported zmem database schema {existing_version}");
         }
         connection.execute_batch(
             &format!("PRAGMA user_version={SCHEMA_VERSION};
@@ -336,7 +349,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS commits(repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,oid TEXT NOT NULL,commit_time INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(repository_id,oid));
              CREATE TABLE IF NOT EXISTS entries(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,annotation_index INTEGER NOT NULL,entry_type TEXT NOT NULL,content TEXT NOT NULL,score REAL NOT NULL,valid INTEGER NOT NULL,commit_time INTEGER NOT NULL DEFAULT 0,scope TEXT,PRIMARY KEY(repository_id,commit_oid,annotation_index),FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
              CREATE TABLE IF NOT EXISTS relationships(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,score REAL NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
-             CREATE TABLE IF NOT EXISTS diagnostics(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,message TEXT NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);"),
+             CREATE TABLE IF NOT EXISTS diagnostics(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,message TEXT NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
+             CREATE TABLE IF NOT EXISTS inspections(commit_oid TEXT NOT NULL,parser_protocol INTEGER NOT NULL,annotation_count INTEGER NOT NULL,parser_diagnostics TEXT NOT NULL,PRIMARY KEY(commit_oid,parser_protocol));"),
         )?;
         Ok(Self { connection })
     }
@@ -362,6 +376,50 @@ impl Store {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?)
+    }
+
+    pub fn inspection(
+        &self,
+        oid: &str,
+        parser_protocol: u32,
+    ) -> anyhow::Result<Option<InspectionRecord>> {
+        let row = self
+            .connection
+            .query_row(
+                "SELECT annotation_count,parser_diagnostics FROM inspections WHERE commit_oid=?1 AND parser_protocol=?2",
+                params![oid, parser_protocol],
+                |row| Ok((row.get::<_, usize>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        row.map(|(annotation_count, diagnostics)| {
+            Ok(InspectionRecord {
+                oid: oid.to_owned(),
+                annotation_count,
+                parser_diagnostics: serde_json::from_str(&diagnostics)?,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn record_inspections(
+        &mut self,
+        parser_protocol: u32,
+        records: &[InspectionRecord],
+    ) -> anyhow::Result<()> {
+        let tx = self.connection.transaction()?;
+        for record in records {
+            tx.execute(
+                "INSERT OR REPLACE INTO inspections(commit_oid,parser_protocol,annotation_count,parser_diagnostics) VALUES(?1,?2,?3,?4)",
+                params![
+                    record.oid,
+                    parser_protocol,
+                    record.annotation_count,
+                    serde_json::to_string(&record.parser_diagnostics)?
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn anchor(&self, repo_id: i64) -> anyhow::Result<Option<Anchor>> {

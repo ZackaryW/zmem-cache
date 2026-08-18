@@ -1,11 +1,11 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zmem_core::{
     Action, Anchor, AttentionCandidate, AttentionLimit, AttentionPolicy, AttentionUsage, GitCommit,
     GitRepo, HostInspection, HostResponse, SCHEMA_VERSION, attention_identity_allows_incremental,
@@ -138,6 +138,7 @@ impl Drop for StartupLock {
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub max_concurrency: NonZeroUsize,
+    pub extension_host_timeout_seconds: NonZeroU64,
     pub max_entries: NonZeroU64,
     pub protect_recent_days: u32,
     pub extension_host: Option<String>,
@@ -147,13 +148,151 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            max_concurrency: NonZeroUsize::new(50).unwrap(),
+            max_concurrency: NonZeroUsize::new(8).unwrap(),
+            extension_host_timeout_seconds: NonZeroU64::new(30).unwrap(),
             max_entries: NonZeroU64::new(3_000_000).unwrap(),
             protect_recent_days: 14,
             extension_host: None,
             extension_host_args: Vec::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostOperation {
+    Identity,
+    Inspection,
+    Expansion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HostExecutionPolicy {
+    attempts: usize,
+    deadline: Duration,
+}
+
+impl HostOperation {
+    fn execution_policy(self, config: &Config) -> HostExecutionPolicy {
+        HostExecutionPolicy {
+            attempts: match self {
+                Self::Identity | Self::Inspection => 2,
+                Self::Expansion => 1,
+            },
+            deadline: Duration::from_secs(config.extension_host_timeout_seconds.get()),
+        }
+    }
+}
+
+fn join_output(
+    reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream: &str,
+) -> anyhow::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("extension host {stream} drainer panicked"))?
+        .with_context(|| format!("could not read extension host {stream}"))
+}
+
+fn execute_supervised(
+    command: &mut Command,
+    input: &[u8],
+    deadline: Duration,
+) -> anyhow::Result<Output> {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("extension host stdout unavailable")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("extension host stderr unavailable")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+
+    let write_result = child
+        .stdin
+        .take()
+        .context("extension host stdin unavailable")?
+        .write_all(input);
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = join_output(stdout_reader, "stdout");
+        let _ = join_output(stderr_reader, "stderr");
+        return Err(error).context("could not write extension host input");
+    }
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= deadline {
+            let _ = child.kill();
+            child
+                .wait()
+                .context("could not reap timed-out extension host")?;
+            let _ = join_output(stdout_reader, "stdout");
+            let _ = join_output(stderr_reader, "stderr");
+            anyhow::bail!(
+                "extension host timed out after {} seconds",
+                deadline.as_secs()
+            );
+        }
+        std::thread::sleep(
+            Duration::from_millis(10).min(deadline.saturating_sub(started.elapsed())),
+        );
+    };
+    Ok(Output {
+        status,
+        stdout: join_output(stdout_reader, "stdout")?,
+        stderr: join_output(stderr_reader, "stderr")?,
+    })
+}
+
+fn execute_host_output_supervised(
+    config: &Config,
+    operation: HostOperation,
+    request: &serde_json::Value,
+) -> anyhow::Result<Vec<u8>> {
+    let host = extension_host_command(config);
+    let policy = operation.execution_policy(config);
+    let input = serde_json::to_vec(request)?;
+    let mut last_error = None;
+    for _ in 0..policy.attempts {
+        let mut command = Command::new(&host.executable);
+        command.args(&host.args);
+        let result = execute_supervised(&mut command, &input, policy.deadline).with_context(|| {
+            format!(
+                "could not run extension host: {}",
+                host.executable.display()
+            )
+        });
+        match result {
+            Ok(output) if output.status.success() => return Ok(output.stdout),
+            Ok(output) => {
+                last_error = Some(anyhow::anyhow!(
+                    "extension host failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("host execution policy has at least one attempt"))
 }
 
 impl Config {
@@ -857,7 +996,8 @@ mod tests {
     #[test]
     fn defaults_match_product_contract() {
         let config = Config::default();
-        assert_eq!(config.max_concurrency.get(), 50);
+        assert_eq!(config.max_concurrency.get(), 8);
+        assert_eq!(config.extension_host_timeout_seconds.get(), 30);
         assert_eq!(config.max_entries.get(), 3_000_000);
         assert_eq!(config.protect_recent_days, 14);
     }
@@ -866,6 +1006,53 @@ mod tests {
     fn zero_limits_are_rejected() {
         let parsed = toml::from_str::<Config>("max_concurrency=0\nmax_entries=1");
         assert!(parsed.is_err());
+        let parsed = toml::from_str::<Config>(
+            "max_concurrency=1\nmax_entries=1\nextension_host_timeout_seconds=0",
+        );
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn host_operation_policy_limits_attempts_and_deadline() {
+        let config = Config::default();
+        assert_eq!(
+            HostOperation::Identity.execution_policy(&config).attempts,
+            2
+        );
+        assert_eq!(
+            HostOperation::Inspection.execution_policy(&config).attempts,
+            2
+        );
+        assert_eq!(
+            HostOperation::Expansion.execution_policy(&config).attempts,
+            1
+        );
+        assert_eq!(
+            HostOperation::Inspection.execution_policy(&config).deadline,
+            std::time::Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn supervised_host_timeout_kills_and_reaps_child() {
+        let mut command = if cfg!(windows) {
+            let mut command = Command::new("powershell");
+            command.args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::Out.Write('started'); Start-Sleep -Seconds 5",
+            ]);
+            command
+        } else {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf started; sleep 5"]);
+            command
+        };
+        let started = Instant::now();
+        let error =
+            execute_supervised(&mut command, b"request", Duration::from_millis(50)).unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

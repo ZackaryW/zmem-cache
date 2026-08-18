@@ -39,18 +39,6 @@ The version-2 database receives an additive migration that creates the table and
 
 Batch validation completes before any count is used. Host timeout, malformed output, retry exhaustion, or database failure returns the existing structured service error path. Repository projection and anchor updates remain after all required host results validate, so a fatal failure cannot publish a partial range.
 
-## Utility Plan (Disposable)
-
-Remove this section after the utilities below have independent fail-first proof and GREEN verification.
-
-- `HostOperation::execution_policy(&Config) -> HostExecutionPolicy` maps identity and inspection to two total attempts, maps hook-capable expansion to one, and carries the positive `Duration` deadline.
-- `execute_supervised(command: &mut Command, input: &[u8], deadline: Duration) -> anyhow::Result<Output>` closes stdin, drains both output streams concurrently, waits against a monotonic deadline, and kills plus reaps before returning a timeout or process error.
-- `execute_host_output(config: &Config, operation: HostOperation, request: &Value) -> anyhow::Result<Vec<u8>>` owns bounded retry and validates process success before protocol decoding.
-- `validate_host_inspection_batch(bytes: &[u8], expected_ids: &[String]) -> anyhow::Result<Vec<HostInspection>>` rejects every shape, identity, order, cardinality, and protocol mismatch as one batch failure.
-- `Store::inspection(oid: &str, parser_protocol: u32) -> anyhow::Result<Option<InspectionRecord>>` and `Store::record_inspections(parser_protocol: u32, records: &[InspectionRecord]) -> anyhow::Result<()>` expose exact-key cache lookup and atomic insertion.
-- `inspect_commits(config: &Config, store: &mut Store, commits: &[GitCommit]) -> anyhow::Result<Vec<HostInspection>>` preserves input order, reuses exact cache hits, batches misses, validates all misses, and persists them before returning.
-- Schema opening owns `migrate_v2_to_v3(transaction) -> anyhow::Result<()>`; no other migration path is accepted.
-
 ## Risks / Trade-offs
 
 - [Eight workers can reduce peak throughput on very large rebuilds] → Cached inspections and batching remove far more startup work than the reduced parallelism costs; users can raise the positive override.

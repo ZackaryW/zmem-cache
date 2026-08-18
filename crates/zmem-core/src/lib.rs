@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-pub const PROTOCOL_VERSION: u32 = 2;
-pub const SCHEMA_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttentionLimit {
@@ -314,6 +314,53 @@ pub struct HostInspection {
     pub annotation_count: usize,
     #[serde(default)]
     pub parser_diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentifiedHostInspection {
+    id: String,
+    annotation_count: usize,
+    #[serde(default)]
+    parser_diagnostics: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostInspectionBatch {
+    protocol_version: u32,
+    inspections: Vec<IdentifiedHostInspection>,
+}
+
+pub fn validate_host_inspection_batch(
+    data: &[u8],
+    expected_ids: &[String],
+) -> anyhow::Result<Vec<HostInspection>> {
+    let batch: HostInspectionBatch = serde_json::from_slice(data)?;
+    anyhow::ensure!(
+        batch.protocol_version == PROTOCOL_VERSION,
+        "unsupported extension protocol"
+    );
+    anyhow::ensure!(
+        batch.inspections.len() == expected_ids.len(),
+        "incomplete extension inspection batch"
+    );
+    batch
+        .inspections
+        .into_iter()
+        .zip(expected_ids)
+        .map(|(inspection, expected)| {
+            anyhow::ensure!(
+                inspection.id == *expected,
+                "extension inspection batch identity or order mismatch"
+            );
+            Ok(HostInspection {
+                protocol_version: PROTOCOL_VERSION,
+                annotation_count: inspection.annotation_count,
+                parser_diagnostics: inspection.parser_diagnostics,
+            })
+        })
+        .collect()
 }
 
 pub fn validate_host_inspection(data: &[u8]) -> anyhow::Result<HostInspection> {
