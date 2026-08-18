@@ -24,3 +24,30 @@ Feature: Python extension-host coordination
     When the service validates the response
     Then the entry remains valid for commit
     And the hook diagnostic remains visible
+
+  Scenario: Timed-out host is reaped without advancing the anchor
+    Given an indexed repository and an extension host that outlives its deadline
+    When the next repository range is indexed
+    Then a host-timeout error is returned
+    And the timed-out host exits without advancing the anchor
+
+  Scenario: Parser-only failure retries once
+    Given a parser-only host that fails its first attempt and succeeds its second
+    When repository attention is selected through the service
+    Then selection succeeds after exactly two parser attempts
+
+  Scenario: Hook-bearing expansion is not retried
+    Given a hook-bearing expansion host that records attempts and fails
+    When its repository range is indexed
+    Then indexing fails after exactly one expansion attempt
+    And the failed range does not advance its anchor
+
+  Scenario: Incomplete inspection batch is rejected
+    Given selected history whose inspection host omits one batch result
+    When repository attention is selected through the service
+    Then the incomplete batch is rejected before history selection
+
+  Scenario: Compatible inspection batch preserves commit order
+    Given selected history with multiple uncached commit messages
+    When repository attention is selected through the service
+    Then the inspection batch associates every result with its commit in order

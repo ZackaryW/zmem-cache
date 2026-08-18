@@ -26,6 +26,23 @@ Feature: Anchored repository indexing
     Then simultaneous expansion never exceeds the configured bound
     And application remains deterministic
 
+  Scenario: Default host concurrency is resource-conservative
+    Given more ready host work than the default concurrency
+    When the repository is indexed without a concurrency override
+    Then simultaneous host execution never exceeds eight
+    And the service reports max_concurrency eight
+
+  Scenario: Repeated selection reuses immutable inspections
+    Given stable history observed through a counting inspection host
+    When the repository is queried twice without parser or history changes
+    Then the second selection starts no inspection hosts
+    And both attention results are identical
+
+  Scenario: Parser identity change invalidates inspections
+    Given history inspected under a previous parser identity
+    When the repository is queried under the current parser identity
+    Then every stale inspection is replaced before attention selection
+
   Scenario: Unlimited attention replaces a bounded projection
     Given a repository anchored with an older decision outside its bounded view
     When the repository is queried with both attention limits unlimited
