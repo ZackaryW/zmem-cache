@@ -23,5 +23,5 @@
 
 ## 5. Documentation and release coordination
 
-- [ ] 5.1 Update operational configuration and recovery documentation without asserting prose through tests
-- [ ] 5.2 Coordinate protocol/schema identities and release ordering with the Python `zmem` change
+- [x] 5.1 Update operational configuration and recovery documentation without asserting prose through tests
+- [x] 5.2 Coordinate protocol/schema identities and document native-first release ordering with the Python `zmem` change

@@ -27,7 +27,7 @@ Tags named `v<workspace-version>` run `.github/workflows/release.yml`, derived f
 
 Assets are named `zmem-svc-<target>` with `.exe` on Windows. `release-manifest.json` records manifest, release, protocol, and schema versions plus each target's asset name, byte length, and lowercase SHA-256 digest. Release assembly fails if the tag, Cargo workspace, captured service identities, target coverage, or artifact names disagree.
 
-The Python client pins package version `N` to this repository's tag `vN`; releases do not follow a mutable latest-compatible channel. Publish the native service release before publishing the same-version `zmem` Python distribution.
+Python clients discover the greatest published stable release whose manifest exactly matches their protocol and schema and includes their platform. Native and Python release numbers are independent. Publish a compatible native service release before publishing a Python distribution that can select it.
 
 Manifest construction can be verified locally without publishing:
 
@@ -61,7 +61,8 @@ Registration canonicalizes the Git root and is idempotent. A query synchronizes 
 Create `~/.zmem/config.toml` to override defaults:
 
 ```toml
-max_concurrency = 50
+max_concurrency = 8
+extension_host_timeout_seconds = 30
 max_entries = 3000000
 protect_recent_days = 14
 # Optional explicit development override:
@@ -69,7 +70,7 @@ protect_recent_days = 14
 # extension_host_args = []
 ```
 
-Both limits must be greater than zero. `protect_recent_days = 0` disables recent-history protection.
+The concurrency, host timeout, and entry limit must be greater than zero. Each one-request extension host has its stdin closed after the request, its output pipes drained concurrently, and a 30-second default deadline; timeout kills and reaps that exact child. Parser inspection is batched and cached by immutable commit plus parser protocol. `protect_recent_days = 0` disables recent-history protection.
 
 Repository requests also accept `--commit-limit` and `--node-limit`, defaulting to 500 newest commits and 400 syntactically valid zmem annotations. `-1` disables one dimension. Direct native requests inherit `ZMEM_COMMIT_LIMIT` and `ZMEM_NODE_LIMIT` unless the corresponding flag is explicit. Entry, custom, unsupported, DECAY, and CANCEL annotations each consume node attention; a boundary commit is excluded whole rather than partially applied. Structured results report effective limits, selected usage, truncation, and the reached bound.
 
