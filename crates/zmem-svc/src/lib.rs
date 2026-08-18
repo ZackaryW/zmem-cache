@@ -10,8 +10,11 @@ use zmem_core::{
     Action, Anchor, AttentionCandidate, AttentionLimit, AttentionPolicy, AttentionUsage, GitCommit,
     GitRepo, HostInspection, HostResponse, SCHEMA_VERSION, attention_identity_allows_incremental,
     run_ordered, select_attention, validate_action_journal, validate_host_inspection,
+    validate_host_inspection_batch,
 };
-use zmem_store::{CommitUpdate, EffectOutcome, RetentionPolicy, Store, select_evictions};
+use zmem_store::{
+    CommitUpdate, EffectOutcome, InspectionRecord, RetentionPolicy, Store, select_evictions,
+};
 
 pub const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -237,16 +240,24 @@ fn execute_supervised(
 
     let started = Instant::now();
     let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let wait_result = child.wait();
+                let _ = join_output(stdout_reader, "stdout");
+                let _ = join_output(stderr_reader, "stderr");
+                wait_result.context("could not reap extension host after wait failure")?;
+                return Err(error).context("could not wait for extension host");
+            }
         }
         if started.elapsed() >= deadline {
             let _ = child.kill();
-            child
-                .wait()
-                .context("could not reap timed-out extension host")?;
+            let wait_result = child.wait();
             let _ = join_output(stdout_reader, "stdout");
             let _ = join_output(stderr_reader, "stderr");
+            wait_result.context("could not reap timed-out extension host")?;
             anyhow::bail!(
                 "extension host timed out after {} seconds",
                 deadline.as_secs()
@@ -337,42 +348,18 @@ fn extension_host_command(config: &Config) -> HostCommand {
         })
 }
 
-fn execute_host_output(config: &Config, request: &serde_json::Value) -> anyhow::Result<Vec<u8>> {
-    let host = extension_host_command(config);
-    let mut command = Command::new(&host.executable);
-    command.args(&host.args);
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "could not start extension host: {}",
-                host.executable.display()
-            )
-        })?;
-    child
-        .stdin
-        .take()
-        .context("extension host stdin unavailable")?
-        .write_all(serde_json::to_string(request)?.as_bytes())?;
-    let output = child.wait_with_output()?;
-    anyhow::ensure!(
-        output.status.success(),
-        "extension host failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(output.stdout)
-}
-
-fn execute_host(config: &Config, request: &serde_json::Value) -> anyhow::Result<HostResponse> {
-    validate_action_journal(&execute_host_output(config, request)?)
+fn execute_host(
+    config: &Config,
+    operation: HostOperation,
+    request: &serde_json::Value,
+) -> anyhow::Result<HostResponse> {
+    validate_action_journal(&execute_host_output_supervised(config, operation, request)?)
 }
 
 fn inspect_host(config: &Config, commit: &GitCommit) -> anyhow::Result<HostInspection> {
-    validate_host_inspection(&execute_host_output(
+    validate_host_inspection(&execute_host_output_supervised(
         config,
+        HostOperation::Inspection,
         &serde_json::json!({
             "protocol_version": zmem_core::PROTOCOL_VERSION,
             "operation": "inspect",
@@ -389,6 +376,7 @@ fn invoke_identity(
 ) -> anyhow::Result<HostResponse> {
     execute_host(
         config,
+        HostOperation::Identity,
         &serde_json::json!({
             "protocol_version":zmem_core::PROTOCOL_VERSION,"operation":"identity","repo":repo.root(),"trusted_extensions":trusted,"global_extension_root":home.join("ext")
         }),
@@ -406,6 +394,7 @@ fn invoke_host(
 ) -> anyhow::Result<HostResponse> {
     execute_host(
         config,
+        HostOperation::Expansion,
         &serde_json::json!({
             "protocol_version": zmem_core::PROTOCOL_VERSION, "operation": "expand", "repo": repo.root(), "commit_sha": commit.sha,
             "message": commit.message, "commit_time": commit.commit_time, "trusted_extensions": trusted,
@@ -507,8 +496,72 @@ struct SelectedHistory {
     usage: AttentionUsage,
 }
 
+const INSPECTION_BATCH_SIZE: usize = 64;
+
+fn inspect_commits(
+    config: &Config,
+    store: &mut Store,
+    commits: &[GitCommit],
+) -> anyhow::Result<Vec<HostInspection>> {
+    let mut results = std::collections::HashMap::new();
+    let mut misses = Vec::new();
+    for commit in commits {
+        if let Some(record) = store.inspection(&commit.sha, zmem_core::PROTOCOL_VERSION)? {
+            results.insert(
+                commit.sha.clone(),
+                HostInspection {
+                    protocol_version: zmem_core::PROTOCOL_VERSION,
+                    annotation_count: record.annotation_count,
+                    parser_diagnostics: record.parser_diagnostics,
+                },
+            );
+        } else {
+            misses.push(commit.clone());
+        }
+    }
+    let batches = misses
+        .chunks(INSPECTION_BATCH_SIZE)
+        .map(<[GitCommit]>::to_vec)
+        .collect::<Vec<_>>();
+    let inspected = run_ordered(batches, config.max_concurrency.get(), |batch| {
+        let expected_ids = batch
+            .iter()
+            .map(|commit| commit.sha.clone())
+            .collect::<Vec<_>>();
+        let request = serde_json::json!({
+            "protocol_version": zmem_core::PROTOCOL_VERSION,
+            "operation": "inspect_batch",
+            "items": batch.iter().map(|commit| serde_json::json!({"id": commit.sha, "message": commit.message})).collect::<Vec<_>>(),
+        });
+        let response = execute_host_output_supervised(config, HostOperation::Inspection, &request)
+            .and_then(|bytes| validate_host_inspection_batch(&bytes, &expected_ids));
+        (expected_ids, response)
+    });
+    let mut records = Vec::with_capacity(misses.len());
+    for (identities, response) in inspected {
+        for (oid, inspection) in identities.into_iter().zip(response?) {
+            records.push(InspectionRecord {
+                oid: oid.clone(),
+                annotation_count: inspection.annotation_count,
+                parser_diagnostics: inspection.parser_diagnostics.clone(),
+            });
+            results.insert(oid, inspection);
+        }
+    }
+    store.record_inspections(zmem_core::PROTOCOL_VERSION, &records)?;
+    commits
+        .iter()
+        .map(|commit| {
+            results
+                .remove(&commit.sha)
+                .with_context(|| format!("missing inspection for commit {}", commit.sha))
+        })
+        .collect()
+}
+
 fn select_history(
     config: &Config,
+    store: &mut Store,
     repo: &GitRepo,
     head: &str,
     policy: AttentionPolicy,
@@ -520,13 +573,9 @@ fn select_history(
         .iter()
         .map(|sha| repo.commit(sha))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let inspected = run_ordered(commits, config.max_concurrency.get(), |commit| {
-        let inspection = inspect_host(config, &commit);
-        (commit, inspection)
-    });
-    let mut candidates = Vec::with_capacity(inspected.len());
-    for (commit, inspection) in inspected {
-        let inspection = inspection?;
+    let inspections = inspect_commits(config, store, &commits)?;
+    let mut candidates = Vec::with_capacity(commits.len());
+    for (commit, inspection) in commits.into_iter().zip(inspections) {
         candidates.push(AttentionCandidate::new(commit, inspection.annotation_count));
     }
     let selection = select_attention(candidates, policy, reserved_nodes, walk.truncated)?;
@@ -777,7 +826,14 @@ pub fn check_repository_with_attention(
             proposed_nodes,
         )
     };
-    let selected = select_history(&config, &repo, &history_head, policy, reserved_nodes)?;
+    let selected = select_history(
+        &config,
+        &mut store,
+        &repo,
+        &history_head,
+        policy,
+        reserved_nodes,
+    )?;
     let mut history = selected
         .commits
         .iter()
@@ -862,7 +918,7 @@ fn sync_repository_with_policy(
     }
 
     let identity = invoke_identity(&config, &home, &repo, trusted)?.extension_hash;
-    let selected = select_history(&config, &repo, &head, policy, 0)?;
+    let selected = select_history(&config, &mut store, &repo, &head, policy, 0)?;
     let lower_boundary = selected.commits.first().map(|commit| commit.sha.as_str());
     let final_anchor = Anchor {
         head: head.clone(),

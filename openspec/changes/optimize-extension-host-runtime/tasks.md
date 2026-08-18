@@ -16,8 +16,8 @@
 
 ## 4. Service composition
 
-- [ ] 4.1 Route identity, inspection, and expansion through the supervised executor with retry authority determined by operation
-- [ ] 4.2 Batch and cache selected-history inspection while preserving attention results and deterministic commit application
+- [x] 4.1 Route identity, inspection, and expansion through the supervised executor with retry authority determined by operation
+- [x] 4.2 Batch and cache selected-history inspection while preserving attention results and deterministic commit application
 - [x] 4.3 Change the default process concurrency to 8 and expose the positive 30-second host deadline configuration
 - [ ] 4.4 Run the extension-coordination and repository-indexing feature roots independently and complete the Rust unit, lint, format, locked-build, and package-build gates
 

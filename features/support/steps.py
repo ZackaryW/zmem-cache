@@ -333,7 +333,7 @@ def then_status_identity(context):
     assert context.payload["running"] is True
     assert context.payload["pid"] == context.ensure_payload["pid"]
     assert context.payload["release_version"]
-    assert context.payload["protocol_version"] == 2
+    assert context.payload["protocol_version"] == 3
 
 
 @given("an alternate zmem home and a separate unused default home")
@@ -675,7 +675,7 @@ def then_custom_persisted(context):
 @given("an extension host response containing data without valid journal provenance")
 def given_unjournaled_response(context):
     context.invalid_journal = json.dumps(
-        {"protocol_version": 2, "extension_hash": "x", "entries": [{"content": "bypass"}]}
+        {"protocol_version": 3, "extension_hash": "x", "entries": [{"content": "bypass"}]}
     )
 
 
@@ -776,6 +776,281 @@ def then_hook_diagnostic_visible(context):
     with database(context) as connection:
         diagnostics = [row[0] for row in connection.execute("SELECT message FROM diagnostics")]
     assert any("hook boom" in message for message in diagnostics)
+
+
+def _configure_observable_host(context, mode: str, *, default_concurrency: bool = False) -> None:
+    run_svc(context, "stop")
+    context.host_state = context.temp_root / f"host-{mode}.state"
+    script = context.temp_root / f"host-{mode}.py"
+    script.write_text(
+        f"""import json, os, sqlite3, sys, time
+from pathlib import Path
+MODE = {mode!r}
+STATE = Path({str(context.host_state)!r})
+request = json.loads(sys.stdin.buffer.read())
+operation = request['operation']
+
+def count_attempt():
+    value = int(STATE.read_text()) if STATE.exists() else 0
+    STATE.write_text(str(value + 1))
+    return value + 1
+
+def response(**values):
+    print(json.dumps({{'protocol_version': 3, **values}}))
+
+if MODE == 'timeout':
+    STATE.write_text(str(os.getpid()))
+    time.sleep(10)
+elif operation == 'identity':
+    response(extension_hash='fake-host', journal={{'version': 1, 'origin': 'zmem-expansion-context', 'actions': []}}, hook_diagnostics=[], annotation_count=0)
+elif operation in ('inspect', 'inspect_batch'):
+    attempt = count_attempt() if MODE != 'concurrency' else 1
+    if MODE == 'parser_retry' and attempt == 1:
+        raise SystemExit(7)
+    items = request.get('items', [{{'id': 'single', 'message': request.get('message', '')}}])
+    inspections = [{{'id': item['id'], 'annotation_count': item['message'].count('zmem('), 'parser_diagnostics': []}} for item in items]
+    if MODE == 'incomplete' and inspections:
+        inspections.pop()
+    if operation == 'inspect':
+        item = inspections[0]
+        response(annotation_count=item['annotation_count'], parser_diagnostics=[])
+    else:
+        response(inspections=inspections)
+elif operation == 'expand':
+    if MODE == 'expansion_fail':
+        count_attempt()
+        raise SystemExit(9)
+    if MODE == 'concurrency':
+        connection = sqlite3.connect(STATE, timeout=10)
+        connection.execute('CREATE TABLE IF NOT EXISTS state(active INTEGER NOT NULL, maximum INTEGER NOT NULL)')
+        connection.execute('INSERT INTO state(active,maximum) SELECT 0,0 WHERE NOT EXISTS(SELECT 1 FROM state)')
+        connection.commit()
+        connection.execute('BEGIN IMMEDIATE')
+        active, maximum = connection.execute('SELECT active,maximum FROM state').fetchone()
+        active += 1
+        connection.execute('UPDATE state SET active=?,maximum=?', (active, max(maximum, active)))
+        connection.commit()
+        time.sleep(0.3)
+        connection.execute('BEGIN IMMEDIATE')
+        connection.execute('UPDATE state SET active=active-1')
+        connection.commit()
+        connection.close()
+    response(extension_hash='fake-host', journal={{'version': 1, 'origin': 'zmem-expansion-context', 'actions': []}}, hook_diagnostics=[], annotation_count=request['message'].count('zmem('))
+else:
+    raise SystemExit(11)
+"""
+    )
+    values = {
+        "max_entries": 3_000_000,
+        "protect_recent_days": 14,
+        "extension_host_timeout_seconds": 1 if mode == "timeout" else 30,
+        "extension_host": sys.executable,
+        "extension_host_args": [str(script)],
+    }
+    if not default_concurrency:
+        values["max_concurrency"] = 2
+    write_config(context, **values)
+    context.env.pop("ZMEM_EXTENSION_HOST", None)
+
+
+def _process_exists(pid: int) -> bool:
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True, check=False
+        )
+        return str(pid) in completed.stdout
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+@given("an indexed repository and an extension host that outlives its deadline")
+def given_timed_host(context):
+    init_repo(context)
+    context.anchor_before_timeout = commit(context, "zmem(DECISION): stable")
+    _query(context)
+    _assert_success(context)
+    commit(context, "zmem(DECISION): must not land")
+    _configure_observable_host(context, "timeout")
+
+
+@when("the next repository range is indexed")
+def when_timed_range_indexed(context):
+    _query(context)
+
+
+@then("a host-timeout error is returned")
+def then_timeout_returned(context):
+    assert context.completed.returncode != 0
+    assert "timed out" in (context.completed.stdout + context.completed.stderr)
+
+
+@then("the timed-out host exits without advancing the anchor")
+def then_timeout_reaped_and_atomic(context):
+    pid = int(context.host_state.read_text())
+    assert not _process_exists(pid)
+    with database(context) as connection:
+        assert connection.execute("SELECT head FROM anchors").fetchone()[0] == context.anchor_before_timeout
+
+
+@given("a parser-only host that fails its first attempt and succeeds its second")
+def given_retrying_parser_host(context):
+    init_repo(context)
+    commit(context, "zmem(DECISION): retry parser")
+    _configure_observable_host(context, "parser_retry")
+
+
+@when("repository attention is selected through the service")
+def when_attention_selected(context):
+    _query(context)
+
+
+@then("selection succeeds after exactly two parser attempts")
+def then_parser_retried_once(context):
+    _assert_success(context)
+    assert context.host_state.read_text() == "2"
+
+
+@given("a hook-bearing expansion host that records attempts and fails")
+def given_failing_expansion_host(context):
+    init_repo(context)
+    commit(context, "zmem(DECISION): no retry")
+    _configure_observable_host(context, "expansion_fail")
+
+
+@when("its repository range is indexed")
+def when_failing_expansion_indexed(context):
+    _query(context)
+
+
+@then("indexing fails after exactly one expansion attempt")
+def then_expansion_not_retried(context):
+    assert context.completed.returncode != 0
+    assert context.host_state.read_text() == "2"
+
+
+@then("the failed range does not advance its anchor")
+def then_failed_expansion_has_no_anchor(context):
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM anchors").fetchone()[0] == 0
+
+
+@given("selected history whose inspection host omits one batch result")
+def given_incomplete_batch_host(context):
+    init_repo(context)
+    commit(context, "zmem(DECISION): first")
+    commit(context, "zmem(DECISION): second")
+    _configure_observable_host(context, "incomplete")
+
+
+@then("the incomplete batch is rejected before history selection")
+def then_incomplete_batch_rejected(context):
+    assert context.completed.returncode != 0
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM inspections").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM anchors").fetchone()[0] == 0
+
+
+@given("selected history with multiple uncached commit messages")
+def given_ordered_uncached_history(context):
+    init_repo(context)
+    context.first_inspected = commit(context, "zmem(DECISION): one")
+    context.second_inspected = commit(context, "zmem(DECISION): two\nzmem(LESSON_LEARNT): extra")
+    _configure_observable_host(context, "ordered")
+
+
+@then("the inspection batch associates every result with its commit in order")
+def then_batch_association_ordered(context):
+    _assert_success(context)
+    with database(context) as connection:
+        counts = dict(connection.execute("SELECT commit_oid,annotation_count FROM inspections"))
+    assert counts[context.first_inspected] == 1
+    assert counts[context.second_inspected] == 2
+
+
+@given("more ready host work than the default concurrency")
+def given_default_concurrency_work(context):
+    init_repo(context)
+    for index in range(12):
+        commit(context, f"zmem(DECISION): default {index}")
+    _configure_observable_host(context, "concurrency", default_concurrency=True)
+
+
+@when("the repository is indexed without a concurrency override")
+def when_default_concurrency_indexed(context):
+    _query(context)
+
+
+@then("simultaneous host execution never exceeds eight")
+def then_default_concurrency_bounded(context):
+    _assert_success(context)
+    with sqlite3.connect(context.host_state) as connection:
+        maximum = connection.execute("SELECT maximum FROM state").fetchone()[0]
+    assert maximum == 8
+
+
+@then("the service reports max_concurrency eight")
+def then_default_concurrency_reported(context):
+    assert context.payload["summary"]["max_concurrency"] == 8
+
+
+@given("stable history observed through a counting inspection host")
+def given_counted_stable_history(context):
+    init_repo(context)
+    commit(context, "zmem(DECISION): cached")
+    _configure_observable_host(context, "counting")
+
+
+@when("the repository is queried twice without parser or history changes")
+def when_stable_history_queried_twice(context):
+    _query(context)
+    _assert_success(context)
+    context.first_attention = context.payload["summary"]["attention"]
+    context.first_inspection_attempts = int(context.host_state.read_text())
+    _query(context)
+
+
+@then("the second selection starts no inspection hosts")
+def then_second_selection_uses_cache(context):
+    _assert_success(context)
+    assert int(context.host_state.read_text()) == context.first_inspection_attempts
+
+
+@then("both attention results are identical")
+def then_cached_attention_identical(context):
+    assert context.payload["summary"]["attention"] == context.first_attention
+
+
+@given("history inspected under a previous parser identity")
+def given_stale_parser_inspections(context):
+    init_repo(context)
+    context.stale_inspection_shas = [
+        commit(context, "zmem(DECISION): stale one"),
+        commit(context, "zmem(DECISION): stale two"),
+    ]
+    _configure_observable_host(context, "counting")
+    _query(context)
+    _assert_success(context)
+    run_svc(context, "stop")
+    with database(context) as connection:
+        connection.execute("UPDATE inspections SET parser_protocol=2")
+
+
+@when("the repository is queried under the current parser identity")
+def when_current_parser_queries(context):
+    _query(context)
+
+
+@then("every stale inspection is replaced before attention selection")
+def then_stale_inspections_replaced(context):
+    _assert_success(context)
+    with database(context) as connection:
+        current = connection.execute(
+            "SELECT COUNT(*) FROM inspections WHERE parser_protocol=3"
+        ).fetchone()[0]
+    assert current == len(context.stale_inspection_shas)
 
 
 @given("a repository with one supported annotation")
