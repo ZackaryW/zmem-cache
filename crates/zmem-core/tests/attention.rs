@@ -7,14 +7,14 @@ use zmem_core::{
 #[test]
 fn inspection_batch_requires_complete_ordered_identity() {
     let expected = vec!["a".to_owned(), "b".to_owned()];
-    let valid = br#"{"protocol_version":3,"inspections":[{"id":"a","annotation_count":1,"parser_diagnostics":[]},{"id":"b","annotation_count":0,"parser_diagnostics":["warning"]}]}"#;
+    let valid = br#"{"protocol_version":4,"inspections":[{"id":"a","annotation_count":1,"parser_diagnostics":[]},{"id":"b","annotation_count":0,"parser_diagnostics":["warning"]}]}"#;
     let parsed = validate_host_inspection_batch(valid, &expected).unwrap();
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0].annotation_count, 1);
 
     for invalid in [
-        br#"{"protocol_version":3,"inspections":[{"id":"a","annotation_count":1,"parser_diagnostics":[]}]}"#.as_slice(),
-        br#"{"protocol_version":3,"inspections":[{"id":"b","annotation_count":0,"parser_diagnostics":[]},{"id":"a","annotation_count":1,"parser_diagnostics":[]}]}"#.as_slice(),
+        br#"{"protocol_version":4,"inspections":[{"id":"a","annotation_count":1,"parser_diagnostics":[]}]}"#.as_slice(),
+        br#"{"protocol_version":4,"inspections":[{"id":"b","annotation_count":0,"parser_diagnostics":[]},{"id":"a","annotation_count":1,"parser_diagnostics":[]}]}"#.as_slice(),
         br#"{"protocol_version":2,"inspections":[{"id":"a","annotation_count":1,"parser_diagnostics":[]},{"id":"b","annotation_count":0,"parser_diagnostics":[]}]}"#.as_slice(),
     ] {
         assert!(validate_host_inspection_batch(invalid, &expected).is_err());
@@ -106,7 +106,7 @@ fn commit_sentinel_is_reported_even_when_nodes_fit() {
 #[test]
 fn parser_only_host_inspection_has_a_distinct_validated_shape() {
     let inspection = validate_host_inspection(
-        br#"{"protocol_version":3,"annotation_count":3,"parser_diagnostics":["bad annotation"]}"#,
+        br#"{"protocol_version":4,"annotation_count":3,"parser_diagnostics":["bad annotation"]}"#,
     )
     .unwrap();
     assert_eq!(inspection.annotation_count, 3);

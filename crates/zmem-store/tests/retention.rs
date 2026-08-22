@@ -1,4 +1,4 @@
-use zmem_store::{Cohort, RetentionPolicy, select_evictions};
+use zmem_store::{Cohort, RetentionPolicy, TrailCohort, select_evictions, select_trail_evictions};
 
 #[test]
 fn oldest_eligible_cohort_is_selected() {
@@ -79,4 +79,32 @@ fn ties_are_deterministic() {
         },
     );
     assert_eq!(plan.targets, vec![(1, "a".into()), (1, "c".into())]);
+}
+
+#[test]
+fn unreferenced_trails_are_selected_by_source_time_before_shared_facts() {
+    let trails = vec![
+        TrailCohort {
+            repository_id: 1,
+            trail_id: "new".into(),
+            source_time: 20,
+            referenced: false,
+            protected: false,
+        },
+        TrailCohort {
+            repository_id: 1,
+            trail_id: "live".into(),
+            source_time: 1,
+            referenced: true,
+            protected: false,
+        },
+        TrailCohort {
+            repository_id: 1,
+            trail_id: "old".into(),
+            source_time: 10,
+            referenced: false,
+            protected: false,
+        },
+    ];
+    assert_eq!(select_trail_evictions(&trails), vec!["old", "new"]);
 }

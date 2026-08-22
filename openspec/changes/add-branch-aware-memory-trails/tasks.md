@@ -1,13 +1,13 @@
 ## 1. Schema and Migration
 
-- [ ] 1.1 Add fail-first store tests for protocol/schema migration, legacy-trail creation, preserved repository/trust/entry/effect state, null/global legacy metadata, and transactional rollback.
-- [ ] 1.2 Implement the minimum trail, membership, shared-fact, sparse-state, metadata, and ref-alias schema plus the explicit prior-schema migration.
-- [ ] 1.3 Migrate each existing anchor/materialized projection into one immutable legacy trail without Git replay and preserve lazy recovery markers for missing reusable facts.
+- [x] 1.1 Add fail-first store tests for protocol/schema migration, legacy-trail creation, preserved repository/trust/entry/effect state, null/global legacy metadata, and transactional rollback.
+- [x] 1.2 Implement the minimum trail, membership, shared-fact, sparse-state, metadata, and ref-alias schema plus the explicit prior-schema migration.
+- [x] 1.3 Migrate each existing anchor/materialized projection into one immutable legacy trail without Git replay and preserve lazy recovery markers for missing reusable facts.
 
 ## 2. Git and Affected-Area Facts
 
-- [ ] 2.1 Add fail-first pure unit matrices for root paths, deepest-common-parent compaction, one-to-three area retention, four-area global fallback, deletions, and old/new rename endpoints.
-- [ ] 2.2 Extend the Git commit boundary to obtain normalized changed-path facts once when a repository-scoped commit fact first enters the cache.
+- [x] 2.1 Add fail-first pure unit matrices for root paths, deepest-common-parent compaction, one-to-three area retention, four-area global fallback, deletions, and old/new rename endpoints.
+- [x] 2.2 Extend the Git commit boundary to obtain normalized changed-path facts once when a repository-scoped commit fact first enters the cache.
 - [ ] 2.3 Implement immutable affected-area derivation and typed intrinsic metadata without retroactively scanning migrated legacy commits.
 
 ## 3. Immutable Trail Selection and Reuse
@@ -19,8 +19,8 @@
 
 ## 4. META Protocol and Trail Effects
 
-- [ ] 4.1 Add fail-first protocol and store matrices for set/add/null operations, declared keys and types, canonical-field rejection, inclusive reachable-ancestry ranges, attention incompleteness, and ancestry-based conflict resolution.
-- [ ] 4.2 Bump the native protocol/schema identities and validate the host's typed metadata-patch journal action without giving the host database authority.
+- [x] 4.1 Add fail-first protocol and store matrices for set/add/null operations, declared keys and types, canonical-field rejection, inclusive reachable-ancestry ranges, attention incompleteness, and ancestry-based conflict resolution.
+- [x] 4.2 Bump the native protocol/schema identities and validate the host's typed metadata-patch journal action without giving the host database authority.
 - [ ] 4.3 Apply complete META ranges transactionally to sparse trail overlays, including merged ancestry, global affected areas, descendant replacement, and explicit post-merge resolution.
 
 ## 5. Query, Retention, and Service Boundary

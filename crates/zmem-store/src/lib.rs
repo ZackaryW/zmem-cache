@@ -5,6 +5,77 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use zmem_core::{Action, Anchor, HostResponse, SCHEMA_VERSION};
 
+const LEGACY_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS repositories(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,trusted_extensions INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS anchors(repository_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,head TEXT NOT NULL,schema_version INTEGER NOT NULL,extension_hash TEXT NOT NULL,attention_identity TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS commits(repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,oid TEXT NOT NULL,commit_time INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(repository_id,oid));
+CREATE TABLE IF NOT EXISTS entries(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,annotation_index INTEGER NOT NULL,entry_type TEXT NOT NULL,content TEXT NOT NULL,score REAL NOT NULL,valid INTEGER NOT NULL,commit_time INTEGER NOT NULL DEFAULT 0,scope TEXT,PRIMARY KEY(repository_id,commit_oid,annotation_index),FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS relationships(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,score REAL NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS diagnostics(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,message TEXT NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
+CREATE TABLE IF NOT EXISTS inspections(commit_oid TEXT NOT NULL,parser_protocol INTEGER NOT NULL,annotation_count INTEGER NOT NULL,parser_diagnostics TEXT NOT NULL,PRIMARY KEY(commit_oid,parser_protocol));";
+
+const TRAIL_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS trails(
+    id TEXT PRIMARY KEY,
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    head_oid TEXT NOT NULL,
+    attention_identity TEXT NOT NULL,
+    extension_identity TEXT NOT NULL,
+    protocol_version INTEGER NOT NULL,
+    schema_version INTEGER NOT NULL,
+    legacy INTEGER NOT NULL DEFAULT 0,
+    selected_commit_count INTEGER NOT NULL DEFAULT 0,
+    selected_node_count INTEGER NOT NULL DEFAULT 0,
+    source_time INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(repository_id,head_oid,attention_identity,extension_identity,protocol_version,schema_version)
+);
+CREATE TABLE IF NOT EXISTS trail_membership(
+    trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
+    repository_id INTEGER NOT NULL,
+    commit_oid TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY(trail_id,commit_oid),
+    FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS commit_metadata(
+    repository_id INTEGER NOT NULL,
+    commit_oid TEXT NOT NULL,
+    affected_areas TEXT,
+    owner TEXT,
+    tags TEXT NOT NULL DEFAULT '[]',
+    reusable_complete INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY(repository_id,commit_oid),
+    FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS trail_entry_state(
+    trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
+    repository_id INTEGER NOT NULL,
+    commit_oid TEXT NOT NULL,
+    annotation_index INTEGER NOT NULL,
+    score REAL NOT NULL,
+    valid INTEGER NOT NULL,
+    PRIMARY KEY(trail_id,commit_oid,annotation_index),
+    FOREIGN KEY(repository_id,commit_oid,annotation_index) REFERENCES entries(repository_id,commit_oid,annotation_index) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS trail_metadata(
+    trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
+    repository_id INTEGER NOT NULL,
+    commit_oid TEXT NOT NULL,
+    affected_areas TEXT,
+    owner TEXT,
+    tags TEXT,
+    conflicts TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY(trail_id,commit_oid),
+    FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS ref_aliases(
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    selector TEXT NOT NULL,
+    trail_id TEXT NOT NULL REFERENCES trails(id) ON DELETE CASCADE,
+    resolved_oid TEXT NOT NULL,
+    PRIMARY KEY(repository_id,selector)
+);";
+
 #[derive(Clone, Debug)]
 pub struct Cohort {
     pub repo_id: i64,
@@ -23,6 +94,33 @@ pub struct RetentionPolicy {
 pub struct EvictionPlan {
     pub targets: Vec<(i64, String)>,
     pub over_capacity: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrailCohort {
+    pub repository_id: i64,
+    pub trail_id: String,
+    pub source_time: i64,
+    pub referenced: bool,
+    pub protected: bool,
+}
+
+pub fn select_trail_evictions(rows: &[TrailCohort]) -> Vec<String> {
+    let mut eligible = rows
+        .iter()
+        .filter(|row| !row.referenced && !row.protected)
+        .collect::<Vec<_>>();
+    eligible.sort_by(|left, right| {
+        (left.source_time, left.repository_id, left.trail_id.as_str()).cmp(&(
+            right.source_time,
+            right.repository_id,
+            right.trail_id.as_str(),
+        ))
+    });
+    eligible
+        .into_iter()
+        .map(|row| row.trail_id.clone())
+        .collect()
 }
 
 pub fn select_evictions(rows: &[Cohort], now: i64, policy: RetentionPolicy) -> EvictionPlan {
@@ -57,6 +155,19 @@ pub fn select_evictions(rows: &[Cohort], now: i64, policy: RetentionPolicy) -> E
 
 pub struct Store {
     connection: Connection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrailRecord {
+    pub id: String,
+    pub head_oid: String,
+    pub attention_identity: String,
+    pub extension_identity: String,
+    pub protocol_version: u32,
+    pub schema_version: u32,
+    pub legacy: bool,
+    pub selected_commit_count: usize,
+    pub selected_node_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +415,9 @@ fn evaluate_update(
                     diagnostic: None,
                 });
             }
+            Action::MetadataPatch { .. } => {
+                anyhow::bail!("metadata patches require trail-aware application")
+            }
         }
     }
     for diagnostic in &update.response.hook_diagnostics {
@@ -324,7 +438,7 @@ impl Store {
         }
         let mut connection = Connection::open(path)?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
-        let existing_version: u32 =
+        let mut existing_version: u32 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if existing_version == 2 {
             let tx = connection.transaction()?;
@@ -339,7 +453,34 @@ impl Store {
                  PRAGMA user_version=3;",
             )?;
             tx.commit()?;
-        } else if existing_version != 0 && existing_version != SCHEMA_VERSION {
+            existing_version = 3;
+        }
+        if existing_version == 3 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(LEGACY_SCHEMA)?;
+            tx.execute_batch(TRAIL_SCHEMA)?;
+            tx.execute_batch(
+                "INSERT INTO trails(id,repository_id,head_oid,attention_identity,extension_identity,protocol_version,schema_version,legacy,selected_commit_count,selected_node_count,source_time)
+                 SELECT 'legacy:' || a.repository_id || ':' || a.head || ':' || a.attention_identity,
+                        a.repository_id,a.head,a.attention_identity,a.extension_hash,4,4,1,
+                        (SELECT COUNT(*) FROM commits c WHERE c.repository_id=a.repository_id),
+                        (SELECT COUNT(*) FROM entries e WHERE e.repository_id=a.repository_id),
+                        COALESCE((SELECT MAX(c.commit_time) FROM commits c WHERE c.repository_id=a.repository_id),0)
+                 FROM anchors a;
+                 INSERT INTO trail_membership(trail_id,repository_id,commit_oid,position)
+                 SELECT t.id,c.repository_id,c.oid,c.commit_time
+                 FROM trails t JOIN commits c ON c.repository_id=t.repository_id WHERE t.legacy=1;
+                 INSERT INTO commit_metadata(repository_id,commit_oid,affected_areas,owner,tags,reusable_complete)
+                 SELECT repository_id,oid,NULL,NULL,'[]',0 FROM commits;
+                 INSERT INTO trail_entry_state(trail_id,repository_id,commit_oid,annotation_index,score,valid)
+                 SELECT t.id,e.repository_id,e.commit_oid,e.annotation_index,e.score,e.valid
+                 FROM trails t JOIN entries e ON e.repository_id=t.repository_id WHERE t.legacy=1;
+                 PRAGMA user_version=4;",
+            )?;
+            tx.commit()?;
+            existing_version = 4;
+        }
+        if existing_version != 0 && existing_version != SCHEMA_VERSION {
             anyhow::bail!("unsupported zmem database schema {existing_version}");
         }
         connection.execute_batch(
@@ -350,7 +491,8 @@ impl Store {
              CREATE TABLE IF NOT EXISTS entries(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,annotation_index INTEGER NOT NULL,entry_type TEXT NOT NULL,content TEXT NOT NULL,score REAL NOT NULL,valid INTEGER NOT NULL,commit_time INTEGER NOT NULL DEFAULT 0,scope TEXT,PRIMARY KEY(repository_id,commit_oid,annotation_index),FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
              CREATE TABLE IF NOT EXISTS relationships(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,score REAL NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
              CREATE TABLE IF NOT EXISTS diagnostics(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,message TEXT NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
-             CREATE TABLE IF NOT EXISTS inspections(commit_oid TEXT NOT NULL,parser_protocol INTEGER NOT NULL,annotation_count INTEGER NOT NULL,parser_diagnostics TEXT NOT NULL,PRIMARY KEY(commit_oid,parser_protocol));"),
+             CREATE TABLE IF NOT EXISTS inspections(commit_oid TEXT NOT NULL,parser_protocol INTEGER NOT NULL,annotation_count INTEGER NOT NULL,parser_diagnostics TEXT NOT NULL,PRIMARY KEY(commit_oid,parser_protocol));
+             {TRAIL_SCHEMA}"),
         )?;
         Ok(Self { connection })
     }
@@ -365,6 +507,73 @@ impl Store {
             [path],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn schema_version(&self) -> anyhow::Result<u32> {
+        Ok(self
+            .connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    pub fn trails(&self, repo_id: i64) -> anyhow::Result<Vec<TrailRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id,head_oid,attention_identity,extension_identity,protocol_version,schema_version,legacy,selected_commit_count,selected_node_count
+             FROM trails WHERE repository_id=?1 ORDER BY id",
+        )?;
+        Ok(statement
+            .query_map([repo_id], |row| {
+                Ok(TrailRecord {
+                    id: row.get(0)?,
+                    head_oid: row.get(1)?,
+                    attention_identity: row.get(2)?,
+                    extension_identity: row.get(3)?,
+                    protocol_version: row.get(4)?,
+                    schema_version: row.get(5)?,
+                    legacy: row.get(6)?,
+                    selected_commit_count: row.get(7)?,
+                    selected_node_count: row.get(8)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn query_trail_entries(
+        &self,
+        trail_id: &str,
+        include_invalid: bool,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        let valid_clause = if include_invalid {
+            ""
+        } else {
+            " AND COALESCE(s.valid,e.valid)=1"
+        };
+        let sql = format!(
+            "SELECT e.commit_oid,e.annotation_index,e.entry_type,e.content,COALESCE(s.score,e.score),COALESCE(s.valid,e.valid),e.commit_time,e.scope,
+                    COALESCE(tm.affected_areas,cm.affected_areas),COALESCE(tm.owner,cm.owner),COALESCE(tm.tags,cm.tags,'[]'),COALESCE(tm.conflicts,'[]')
+             FROM trail_membership m
+             JOIN entries e ON e.repository_id=m.repository_id AND e.commit_oid=m.commit_oid
+             LEFT JOIN trail_entry_state s ON s.trail_id=m.trail_id AND s.commit_oid=e.commit_oid AND s.annotation_index=e.annotation_index
+             LEFT JOIN commit_metadata cm ON cm.repository_id=e.repository_id AND cm.commit_oid=e.commit_oid
+             LEFT JOIN trail_metadata tm ON tm.trail_id=m.trail_id AND tm.commit_oid=e.commit_oid
+             WHERE m.trail_id=?1{valid_clause} ORDER BY m.position,e.annotation_index"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        Ok(statement
+            .query_map([trail_id], |row| {
+                let affected: Option<String> = row.get(8)?;
+                let tags: String = row.get(10)?;
+                let conflicts: String = row.get(11)?;
+                Ok(serde_json::json!({
+                    "sha":row.get::<_,String>(0)?,"index":row.get::<_,u32>(1)?,"type":row.get::<_,String>(2)?,
+                    "content":row.get::<_,String>(3)?,"score":row.get::<_,f64>(4)?,"valid":row.get::<_,bool>(5)?,
+                    "commit_time":row.get::<_,i64>(6)?,"scope":row.get::<_,Option<String>>(7)?,
+                    "affected_areas":affected.map(|value| serde_json::from_str::<serde_json::Value>(&value)).transpose().map_err(|error| rusqlite::Error::FromSqlConversionFailure(8, rusqlite::types::Type::Text, Box::new(error)))?,
+                    "owner":row.get::<_,Option<String>>(9)?,
+                    "tags":serde_json::from_str::<serde_json::Value>(&tags).map_err(|error| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(error)))?,
+                    "metadata_conflicts":serde_json::from_str::<serde_json::Value>(&conflicts).map_err(|error| rusqlite::Error::FromSqlConversionFailure(11, rusqlite::types::Type::Text, Box::new(error)))?
+                }))
+            })?
+            .collect::<Result<_, _>>()?)
     }
 
     pub fn repository(&self, path: &str) -> anyhow::Result<Option<(i64, bool)>> {

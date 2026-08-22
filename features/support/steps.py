@@ -333,7 +333,7 @@ def then_status_identity(context):
     assert context.payload["running"] is True
     assert context.payload["pid"] == context.ensure_payload["pid"]
     assert context.payload["release_version"]
-    assert context.payload["protocol_version"] == 3
+    assert context.payload["protocol_version"] == 4
 
 
 @given("an alternate zmem home and a separate unused default home")
@@ -675,7 +675,7 @@ def then_custom_persisted(context):
 @given("an extension host response containing data without valid journal provenance")
 def given_unjournaled_response(context):
     context.invalid_journal = json.dumps(
-        {"protocol_version": 3, "extension_hash": "x", "entries": [{"content": "bypass"}]}
+        {"protocol_version": 4, "extension_hash": "x", "entries": [{"content": "bypass"}]}
     )
 
 
@@ -796,7 +796,7 @@ def count_attempt():
     return value + 1
 
 def response(**values):
-    print(json.dumps({{'protocol_version': 3, **values}}))
+    print(json.dumps({{'protocol_version': 4, **values}}))
 
 if MODE == 'timeout':
     STATE.write_text(str(os.getpid()))
