@@ -28,8 +28,8 @@ The extension host SHALL return a typed journal of entry, relationship, decay, c
 - **WHEN** executable behavior is covered by `features/extension-coordination/extension-coordination.feature::Expander attempts to bypass its context`
 - **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
-### Requirement: Extension identity participates in anchoring
-The service SHALL compare the current trusted extension-set identity with the repository anchor and rebuild the repository when they differ.
+### Requirement: Extension identity participates in trail selection
+The service SHALL include the current trusted extension-set identity in trail compatibility and construct a new trail when it differs.
 
 #### Scenario: Global expander changes
 - **WHEN** an indexed repository observes a changed global expander source hash
@@ -43,11 +43,11 @@ Hook failures returned by the extension host SHALL be exposed as diagnostics wit
 - **THEN** the entry can commit and the hook failure remains visible to the client
 
 ### Requirement: Extension host execution is supervised
-Every extension-host operation SHALL run under the configured positive deadline, defaulting to 30 seconds. The service SHALL close the request input, continuously collect output, and kill and reap the exact child when the operation times out or its process boundary fails. A fatal host failure SHALL return a structured service error and SHALL NOT advance or partially replace a repository anchor.
+Every extension-host operation SHALL run under the configured positive deadline, defaulting to 30 seconds. The service SHALL close the request input, continuously collect output, and kill and reap the exact child when the operation times out or its process boundary fails. A fatal host failure SHALL return a structured service error and SHALL NOT publish a partial or replacement trail.
 
 #### Scenario: Host exceeds its deadline
 - **WHEN** an extension host invoked through a repository command remains running beyond the configured deadline
-- **THEN** the command fails with a timeout diagnostic, the host is no longer running, and the repository anchor remains unchanged
+- **THEN** the command fails with a timeout diagnostic, the host is no longer running, and no partial or replacement trail is published
 
 ### Requirement: Host retries respect side-effect authority
 A failed parser inspection or extension-identity operation SHALL be retried once through a fresh supervised process after the failed process is cleaned up. An expansion operation that can execute hooks SHALL NOT be retried automatically because hooks may perform external side effects.

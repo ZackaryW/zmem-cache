@@ -7,7 +7,7 @@ Defines the sole-writer service behavior for non-persistent fast simulation and 
 ## Requirements
 
 ### Requirement: Fast checks simulate against synchronized cache state
-The service SHALL synchronize the selected repository through its current `HEAD`, expand a proposed successor message with a reserved virtual commit identity, validate its action journal, and simulate its ordered actions against the synchronized repository state without retaining the virtual commit or advancing the anchor.
+The service SHALL synchronize the selected repository through its current `HEAD`, expand a proposed successor message with a reserved virtual commit identity, validate its action journal, and simulate its ordered actions against the selected immutable trail without retaining the virtual commit or persisting hypothetical successor state. Synchronizing the real selected history MAY publish a reusable base trail for the effective attention policy.
 
 #### Scenario: Fast cancellation simulation
 - **WHEN** a proposed successor contains a valid CANCEL for a cached reachable decision
@@ -47,8 +47,8 @@ The service SHALL use the repository's persisted extension-trust decision, SHALL
 - **THEN** those files are not imported and the check reports the corresponding extension diagnostic
 
 ### Requirement: Check responses are structured and non-persistent
-The service SHALL return a versioned structured result containing mode, repository, evaluated parent or target, extension identity, actions, effect outcomes, diagnostics, hook state, effective attention limits, observed usage, truncation state, and reached-bound reason. Fatal host, protocol, Git, storage, or attention-validation failures SHALL return a structured service error. Semantic results made inconclusive by omitted history SHALL remain available but unsuccessful. No check SHALL persist its virtual commit, projected actions, projected diagnostics, or projected anchor.
+The service SHALL return a versioned structured result containing mode, repository, evaluated parent or target, extension identity, actions, effect outcomes, diagnostics, hook state, effective attention limits, observed usage, truncation state, and reached-bound reason. Fatal host, protocol, Git, storage, or attention-validation failures SHALL return a structured service error. Semantic results made inconclusive by omitted history SHALL remain available but unsuccessful. No check SHALL persist its virtual commit, projected actions, projected diagnostics, or projected trail state.
 
 #### Scenario: Persistent state survives failed check
 - **WHEN** action-journal validation or proposed-message attention validation fails during a check
-- **THEN** the request fails and all previously stored entries, relationships, diagnostics, and anchors remain unchanged
+- **THEN** the request fails and all previously stored shared facts, trail state, relationships, and diagnostics remain unchanged

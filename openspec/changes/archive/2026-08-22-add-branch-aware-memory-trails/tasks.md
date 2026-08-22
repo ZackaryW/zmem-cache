@@ -37,6 +37,6 @@
 
 ## 7. Complete Verification and Release Compatibility
 
-- [ ] 7.1 Run `cargo fmt --check`, strict configured Clippy, the complete locked Cargo test suite, Python release-manifest tests, and all capability-owned Behave roots independently.
-- [ ] 7.2 Build the locked release artifacts and validate version-json, release manifest protocol/schema identities, migration from the prior database, and a clean native package/release build.
-- [ ] 7.3 Verify an end-to-end `zmem --ref ... --area ...` query with the paired Python host before publishing the native release ahead of the selecting Python package.
+- [x] 7.1 Run `cargo fmt --check`, strict configured Clippy, the complete locked Cargo test suite, Python release-manifest tests, and all capability-owned Behave roots independently.
+- [x] 7.2 Build the locked release artifacts and validate version-json, release manifest protocol/schema identities, migration from the prior database, and a clean native package/release build.
+- [x] 7.3 Verify an end-to-end `zmem --ref ... --area ...` query with the paired Python host before publishing the native release ahead of the selecting Python package.

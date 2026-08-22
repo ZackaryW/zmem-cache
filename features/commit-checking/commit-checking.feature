@@ -3,7 +3,7 @@ Feature: Simulate zmem commit effects without persistence
     Given an indexed repository with one valid decision
     When I fast-check a proposed cancellation of that decision
     Then the service reports the decision would become invalid with score 0.0
-    And the stored entry and anchor remain unchanged after the check
+    And the stored entry and selected trail remain unchanged after the check
 
   Scenario: Ordered effects share canonical evaluation
     Given an indexed repository with one valid decision

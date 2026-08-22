@@ -14,7 +14,7 @@ Each immutable trail SHALL identify its resolved HEAD, schema version, extension
 - **WHEN** executable behavior is covered by `features/repository-indexing/repository-indexing.feature::Fast-forward branch update`
 - **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
-### Requirement: Invalid anchors trigger repository rebuilds
+### Requirement: Incompatible selections construct new trails
 When no retained trail is compatible with the requested resolved HEAD, attention identity, schema, or extension-set identity, the service SHALL construct a new bounded trail from the selected reachable history. It SHALL NOT delete shared facts or other trails that remain referenced or retained.
 
 #### Scenario: BDD target — History rewrite removes a cancellation
@@ -25,7 +25,7 @@ When no retained trail is compatible with the requested resolved HEAD, attention
 - **WHEN** executable behavior is covered by `features/repository-indexing/repository-indexing.feature::Unlimited request follows a bounded trail`
 - **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
-### Requirement: Effects and anchor advancement are atomic
+### Requirement: Effects and trail publication are atomic
 Entry-fact creation, trail membership, DECAY/CANCEL state, META overlays and conflicts, diagnostics, and trail publication for a selected range SHALL commit atomically. Effects SHALL not be stored as queryable entries.
 
 #### Scenario: BDD target — Indexing fails while applying an effect

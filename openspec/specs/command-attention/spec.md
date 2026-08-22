@@ -18,7 +18,7 @@ Repository requests SHALL carry effective commit and node limits, defaulting to 
 - **THEN** the service returns a structured configuration or request failure before traversing Git history
 
 ### Requirement: Selection is newest-first and replay is parent-first
-The service SHALL select the newest reachable commits until the first effective bound is reached, then replay only whole selected commits in parent-before-child order. Every syntactically valid built-in, custom, unsupported, DECAY, and CANCEL annotation SHALL consume one node-attention unit before expansion; plain prose and hook actions SHALL consume none. If another commit would exceed the node limit, the service SHALL exclude that entire commit and all older history.
+The service SHALL select the newest reachable commits until the first effective bound is reached, then replay only whole selected commits in parent-before-child order. Every syntactically valid built-in, custom, unsupported, DECAY, CANCEL, and META annotation SHALL consume one node-attention unit before expansion; plain prose and hook actions SHALL consume none. If another commit would exceed the node limit, the service SHALL exclude that entire commit and all older history.
 
 #### Scenario: Cancellation consumes attention without consuming capacity
 - **WHEN** a selected commit contains CANCEL
@@ -29,7 +29,7 @@ The service SHALL select the newest reachable commits until the first effective 
 - **THEN** none of that commit is expanded or applied and the result identifies node-attention truncation
 
 ### Requirement: Attention state is explicit
-Every repository synchronization, query, and check result SHALL identify the effective limits, observed selected commit and annotation counts, whether either bound omitted reachable history, and which bound was reached. A cached projection or anchor SHALL retain enough attention identity to prevent a bounded view from being represented or reused as a complete-history view.
+Every repository synchronization, query, and check result SHALL identify the effective limits, observed selected commit and annotation counts, whether either bound omitted reachable history, and which bound was reached. Every trail SHALL retain enough attention identity to prevent a bounded view from being represented or reused as a complete-history view.
 
 #### Scenario: Unlimited request does not reuse a bounded projection as complete
 - **WHEN** a repository previously projected under defaults is requested with both limits `-1`

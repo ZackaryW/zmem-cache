@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import sqlite3
@@ -43,13 +44,36 @@ def _entry(context, sha: str) -> dict:
     return {"sha": row[0], "index": row[1], "type": row[2], "score": row[3], "valid": bool(row[4])}
 
 
+def _persistent_state(context) -> str:
+    with database(context) as connection:
+        return "\n".join(connection.iterdump())
+
+
+def _trail_rows(context) -> set[tuple[object, ...]]:
+    with database(context) as connection:
+        return set(
+            connection.execute(
+                "SELECT id,repository_id,head_oid,attention_identity,extension_identity,protocol_version,"
+                "schema_version,legacy,selected_commit_count,selected_node_count,source_time FROM trails"
+            ).fetchall()
+        )
+
+
+def _assert_persistent_state(context) -> None:
+    after = _persistent_state(context)
+    assert after == context.persistent_before, "\n".join(
+        difflib.unified_diff(context.persistent_before.splitlines(), after.splitlines())
+    )
+
+
 @given("an indexed repository with one valid decision")
 def given_check_valid_decision(context):
     init_repo(context)
     context.decision_sha = commit(context, "zmem(DECISION): preview target")
     run_svc(context, "add", str(context.repo))
     _assert_success(context)
-    context.anchor_before = context.payload["head"]
+    context.persistent_before = _persistent_state(context)
+    context.trails_before = _trail_rows(context)
 
 
 @when("I fast-check a proposed cancellation of that decision")
@@ -68,13 +92,16 @@ def then_service_projects_cancel(context):
     assert effect["after_valid"] is False and effect["after_score"] == 0.0
 
 
-@then("the stored entry and anchor remain unchanged after the check")
+@then("the stored entry and selected trail remain unchanged after the check")
 def then_store_unchanged_after_check(context):
     assert _entry(context, context.decision_sha)["valid"] is True
     with database(context) as connection:
-        anchor = connection.execute("SELECT head FROM anchors").fetchone()[0]
         virtual = connection.execute("SELECT COUNT(*) FROM commits WHERE oid=?1", ["0" * 40]).fetchone()[0]
-    assert anchor == context.anchor_before and virtual == 0
+        invalid = connection.execute(
+            "SELECT COUNT(*) FROM trail_entry_state WHERE commit_oid=?1 AND valid=0", [context.decision_sha]
+        ).fetchone()[0]
+    assert context.trails_before <= _trail_rows(context)
+    assert virtual == 0 and invalid == 0
 
 
 @when("I fast-check a decay followed by cancellation of that decision")
@@ -144,7 +171,6 @@ def then_cache_rejected_effect(context):
 
 @given("reachable history whose decision row is absent from the persistent cache")
 def given_evicted_decision(context):
-    write_config(context, max_entries=1, protect_recent_days=0)
     init_repo(context)
     context.decision_sha = commit(
         context,
@@ -155,6 +181,7 @@ def given_evicted_decision(context):
     run_svc(context, "add", str(context.repo))
     _assert_success(context)
     with database(context) as connection:
+        connection.execute("DELETE FROM entries WHERE commit_oid=?1", [context.decision_sha])
         assert (
             connection.execute("SELECT COUNT(*) FROM entries WHERE commit_oid=?1", [context.decision_sha]).fetchone()[0]
             == 0
@@ -1227,11 +1254,7 @@ def _given_proposed_cancel_before_view(context):
     context.proposed_message = f"fix: cancel\n\nzmem(CANCEL)[{context.decision_sha[:8]}, 1]"
     _query(context)
     _assert_success(context)
-    with database(context) as connection:
-        context.persistent_before = (
-            connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0],
-            connection.execute("SELECT attention_identity FROM anchors").fetchone()[0],
-        )
+    context.persistent_before = _persistent_state(context)
 
 
 @given("a proposed cancellation whose decision precedes its attention view")
@@ -1264,12 +1287,7 @@ def then_deep_effect_incomplete(context):
 
 @then("persistent state remains unchanged")
 def then_attention_check_persistent_unchanged(context):
-    with database(context) as connection:
-        after = (
-            connection.execute("SELECT COUNT(*) FROM entries").fetchone()[0],
-            connection.execute("SELECT attention_identity FROM anchors").fetchone()[0],
-        )
-    assert after == context.persistent_before
+    _assert_persistent_state(context)
 
 
 @given("a proposed cancellation whose decision precedes its default attention view")

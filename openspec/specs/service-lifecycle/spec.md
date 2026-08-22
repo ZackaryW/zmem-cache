@@ -47,7 +47,7 @@ The service SHALL coordinate competing start attempts so that one healthy per-us
 
 #### Scenario: Add a non-repository
 - **WHEN** add receives a path that is not inside a Git repository
-- **THEN** registration fails without creating an anchor or entries
+- **THEN** registration fails without creating repository, trail, or entry state
 
 ### Requirement: Queries observe the selected HEAD
 Before answering a repository query, the service SHALL resolve the requested Git commit-ish or observed worktree HEAD, compare it with the client's observed OID, and select or construct a compatible immutable trail through that exact commit. Resolution, synchronization, or stale-ref failure SHALL return a structured error without returning another trail.

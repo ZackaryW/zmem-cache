@@ -21,7 +21,7 @@ Trail state and shared commit facts newer than the wall-clock cutoff of `protect
 - **WHEN** executable behavior is covered by `features/cache-retention/cache-retention.feature::Protected trail state exceeds capacity`
 - **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
-### Requirement: Eviction preserves anchor correctness
+### Requirement: Eviction preserves trail correctness
 Eviction SHALL NOT mutate a retained immutable trail, remove shared facts it references, move a live ref alias without fresh Git resolution, or cause already materialized trail effects to apply twice.
 
 #### Scenario: BDD target — Query after unreferenced trail eviction
