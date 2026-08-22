@@ -51,3 +51,18 @@ Feature: Python extension-host coordination
     Given selected history with multiple uncached commit messages
     When repository attention is selected through the service
     Then the inspection batch associates every result with its commit in order
+
+  Scenario: Protocol version mismatch
+    Given an extension host reporting an incompatible trail protocol
+    When the service requests expansion for a candidate trail
+    Then construction fails without publishing shared facts or trail state
+
+  Scenario: Extension context records metadata patch
+    Given a host journal containing a validated ordered metadata-patch action
+    When the service constructs its selected trail
+    Then the service validates and atomically applies the complete metadata range
+
+  Scenario: Expander attempts to bypass its context
+    Given a host response containing data absent from its validated action journal
+    When the service validates the response
+    Then it rejects the response without publishing the candidate trail

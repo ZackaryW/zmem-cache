@@ -48,3 +48,28 @@ Feature: Anchored repository indexing
     When the repository is queried with both attention limits unlimited
     Then complete history is rebuilt and the older decision is returned
     And the anchor reports a complete attention identity
+
+  Scenario: Mixed supported and unsupported annotations
+    Given a selected commit with a supported entry, unsupported annotation, and valid effect
+    When its immutable trail is indexed
+    Then all annotations consume attention, only the entry consumes capacity, and the effect updates trail state
+
+  Scenario: Fast-forward branch update
+    Given a retained trail whose branch advances by two commits
+    When the advanced branch is queried under the same compatible view
+    Then a distinct trail reuses prior shared facts and indexes the new commits
+
+  Scenario: History rewrite removes a cancellation
+    Given a retained trail reaching a cancellation and a rewritten branch without it
+    When the rewritten branch is queried
+    Then its new trail reports the uncancelled state while the former trail stays immutable
+
+  Scenario: Unlimited request follows a bounded trail
+    Given only a default-bounded trail for a repository
+    When the repository is queried with unlimited commit and node attention
+    Then a complete-history trail is constructed instead of reusing the bounded view as complete
+
+  Scenario: Indexing fails while applying an effect
+    Given a candidate trail with a fatal effect failure
+    When indexing reaches that effect
+    Then neither partial target state nor a partial trail is visible

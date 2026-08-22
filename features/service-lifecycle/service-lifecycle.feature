@@ -40,3 +40,13 @@ Feature: Per-user zmem service lifecycle
     Given no zmem service is running for the isolated user home
     When two authorized clients ensure the service concurrently
     Then both clients observe the same healthy service identity
+
+  Scenario: HEAD advanced before query
+    Given a registered repository whose observed HEAD has advanced
+    When that exact observed commit is queried
+    Then the service returns an immutable trail through that commit
+
+  Scenario: Query a non-checked-out ref
+    Given a resolvable tag, branch, or commit that is not checked out
+    When the selector and observed identity are queried
+    Then the compatible trail is returned without modifying the worktree

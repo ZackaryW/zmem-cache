@@ -26,3 +26,18 @@ Feature: Rolling cache retention
     Given entries behind a current repository anchor are evicted
     When that unchanged repository synchronizes again
     Then its anchored range is not replayed
+
+  Scenario: Capacity exceeded by an unreferenced trail
+    Given capacity is exceeded by old unreferenced trail state sharing commit facts
+    When retention runs after a write
+    Then unreferenced trail state is evicted before facts used by a retained trail
+
+  Scenario: Recently reused old fact
+    Given an old shared commit fact reused by a new trail
+    When retention orders eligible shared facts
+    Then reuse does not make the fact newer than its source commit time
+
+  Scenario: Query after unreferenced trail eviction
+    Given overlapping facts in a retained trail and an old unreferenced trail
+    When the old trail is evicted and the retained trail is queried
+    Then the retained state is reused without duplicate effect application
