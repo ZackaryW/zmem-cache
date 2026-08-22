@@ -1,4 +1,10 @@
-## ADDED Requirements
+# commit-metadata Specification
+
+## Purpose
+
+Defines typed intrinsic commit metadata and trail-specific META overlays.
+
+## Requirements
 
 ### Requirement: Commit metadata is typed and layered
 The service SHALL expose `affected_areas` as null or an ordered unique area array, `owner` as null or a string, and `tags` as an ordered unique string array. A trail's effective metadata SHALL layer its META overlay over the shared intrinsic metadata without modifying the underlying commit or entry fact.

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Defines bounded SQLite persistence that evicts old Git commits predictably while protecting recent memory from capacity pressure.
+Defines bounded SQLite persistence that evicts unreferenced trail state and shared facts predictably while protecting retained memory.
 
 ## Requirements
 
@@ -14,29 +14,29 @@ The service SHALL be the sole writer of `~/.zmem/db/entries.db` and SHALL create
 - **THEN** the service creates a usable schema before accepting repository work
 
 ### Requirement: Capacity is configurable and rolling
-The cache SHALL default to 3,000,000 stored entries and accept a positive `max_entries` override from `~/.zmem/config.toml`. After writes, it SHALL evict eligible source commits until the count is at or below capacity or no eligible commit remains.
+The cache SHALL default to 3,000,000 stored entry facts and accept a positive `max_entries` override from `~/.zmem/config.toml`. After writes, it SHALL evict eligible unreferenced trail state and then eligible shared commit cohorts until capacity is satisfied or no eligible data remains. Shared facts referenced by any retained trail SHALL remain.
 
-#### Scenario: Capacity exceeded by eligible history
-- **WHEN** a write places the cache above capacity and old eligible commits exist
-- **THEN** whole commits are evicted until the capacity is satisfied
+#### Scenario: BDD target — Capacity exceeded by an unreferenced trail
+- **WHEN** executable behavior is covered by `features/cache-retention/cache-retention.feature::Capacity exceeded by an unreferenced trail`
+- **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
 ### Requirement: Eviction uses source committer time
-Eviction SHALL remove every entry and relationship owned by the eligible commit with the oldest Git committer timestamp, never database modification time. Equal timestamps SHALL use deterministic repository-ID and commit-OID ordering.
+Eviction ordering for trail state and shared commit cohorts SHALL use source Git committer time rather than database modification time. Equal timestamps SHALL use deterministic repository, trail, and commit identity ordering.
 
-#### Scenario: Recently modified old entry
-- **WHEN** an old commit's stored entry was recently updated by an effect
-- **THEN** it retains its original eviction age and remains older than later commits
+#### Scenario: BDD target — Recently reused old fact
+- **WHEN** executable behavior is covered by `features/cache-retention/cache-retention.feature::Recently reused old fact`
+- **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
 ### Requirement: Recent commits are protected
-Commits newer than the wall-clock cutoff of `protect_recent_days` SHALL be ineligible for eviction. The setting SHALL default to 14 days and `0` SHALL disable protection.
+Trail state and shared commit facts newer than the wall-clock cutoff of `protect_recent_days` SHALL be ineligible for eviction. The setting SHALL default to 14 days and `0` SHALL disable protection.
 
-#### Scenario: Protected entries exceed capacity
-- **WHEN** protected entries alone exceed `max_entries`
-- **THEN** none are evicted and the cache temporarily exceeds the nominal capacity
+#### Scenario: BDD target — Protected trail state exceeds capacity
+- **WHEN** executable behavior is covered by `features/cache-retention/cache-retention.feature::Protected trail state exceeds capacity`
+- **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
 ### Requirement: Eviction preserves anchor correctness
-Evicting entries SHALL NOT move a repository anchor backward or cause already indexed effects to be applied twice.
+Eviction SHALL NOT mutate a retained immutable trail, remove shared facts it references, move a live ref alias without fresh Git resolution, or cause already materialized trail effects to apply twice.
 
-#### Scenario: Query after eviction
-- **WHEN** old entries were evicted but the repository HEAD has not changed
-- **THEN** synchronization does not replay the anchored range solely to recreate evicted entries
+#### Scenario: BDD target — Query after unreferenced trail eviction
+- **WHEN** executable behavior is covered by `features/cache-retention/cache-retention.feature::Query after unreferenced trail eviction`
+- **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps

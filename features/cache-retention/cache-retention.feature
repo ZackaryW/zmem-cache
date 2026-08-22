@@ -4,7 +4,7 @@ Feature: Rolling cache retention
     When the store opens
     Then a usable entries database exists under .zmem/db
 
-  Scenario: Recent protection overrides capacity
+  Scenario: Protected trail state exceeds capacity
     Given protected commits alone exceed max_entries
     When retention runs with protect_recent_days set to 14
     Then no protected commit is evicted

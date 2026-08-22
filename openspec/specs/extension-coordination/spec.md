@@ -7,22 +7,26 @@ Defines how the Rust service obtains deterministic derived data from the trusted
 ## Requirements
 
 ### Requirement: Service validates extension-host exchanges
-The service SHALL exchange versioned typed messages with the extension host and reject incompatible, malformed, or non-deterministically identified responses before committing derived state.
+The service SHALL exchange protocol-v4 typed messages with the extension host and reject incompatible, malformed, or non-deterministically identified entry, relationship, DECAY, CANCEL, META, or diagnostic responses before committing shared facts or trail state.
 
-#### Scenario: Protocol version mismatch
-- **WHEN** the extension host reports an unsupported protocol version
-- **THEN** repository indexing fails without advancing its anchor
+#### Scenario: BDD target — Protocol version mismatch
+- **WHEN** executable behavior is covered by `features/extension-coordination/extension-coordination.feature::Protocol version mismatch`
+- **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
 ### Requirement: Service remains the only canonical writer
-The extension host SHALL return a typed journal of entry, relationship, decay, cancel, and diagnostic actions that expanders performed through their contexts, together with hook diagnostics and an extension-set identity; it SHALL receive no direct database write access. The service SHALL validate and apply journal actions transactionally.
+The extension host SHALL return a typed journal of entry, relationship, decay, cancel, metadata-patch, and diagnostic actions performed through expander contexts, together with hook diagnostics and an extension-set identity; it SHALL receive no direct database write access. The service SHALL validate shared-fact actions and apply reachability-dependent actions transactionally within the selected trail.
 
 #### Scenario: Extension context records derived data
 - **WHEN** a trusted custom expander performs a valid add-entry action through its context
 - **THEN** the host journals the action and the service validates and writes it within its indexing transaction
 
-#### Scenario: Expander attempts to bypass its context
-- **WHEN** an extension host response contains data not produced by a validated context action journal
-- **THEN** the service rejects the response without advancing the repository anchor
+#### Scenario: BDD target — Extension context records metadata patch
+- **WHEN** executable behavior is covered by `features/extension-coordination/extension-coordination.feature::Extension context records metadata patch`
+- **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
+
+#### Scenario: BDD target — Expander attempts to bypass its context
+- **WHEN** executable behavior is covered by `features/extension-coordination/extension-coordination.feature::Expander attempts to bypass its context`
+- **THEN** that exact feature scenario is the executable authority and this specification does not repeat its steps
 
 ### Requirement: Extension identity participates in anchoring
 The service SHALL compare the current trusted extension-set identity with the repository anchor and rebuild the repository when they differ.

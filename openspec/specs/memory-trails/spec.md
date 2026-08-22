@@ -1,4 +1,10 @@
-## ADDED Requirements
+# memory-trails Specification
+
+## Purpose
+
+Defines immutable native trail identity, fact reuse, live Git resolution, migration, and provenance.
+
+## Requirements
 
 ### Requirement: Compatible projections are immutable trails
 The service SHALL identify a trail by repository, resolved HEAD OID, effective attention identity, extension identity, and protocol/schema identity. A committed trail's identity, selected commit membership, and materialized outcomes SHALL be immutable; a changed input SHALL select or create another trail.
