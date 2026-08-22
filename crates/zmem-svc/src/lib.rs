@@ -8,12 +8,13 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zmem_core::{
     Action, Anchor, AttentionCandidate, AttentionLimit, AttentionPolicy, AttentionUsage, GitCommit,
-    GitRepo, HostInspection, HostResponse, SCHEMA_VERSION, attention_identity_allows_incremental,
+    GitRepo, HostInspection, HostResponse, SCHEMA_VERSION, TrailIdentity, derive_affected_areas,
     run_ordered, select_attention, validate_action_journal, validate_host_inspection,
     validate_host_inspection_batch,
 };
 use zmem_store::{
-    CommitUpdate, EffectOutcome, InspectionRecord, RetentionPolicy, Store, select_evictions,
+    CommitUpdate, EffectOutcome, InspectionRecord, RetentionPolicy, Store, TrailPublication,
+    TrailRecord, select_evictions, select_trail_evictions,
 };
 
 pub const RELEASE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -201,6 +202,11 @@ fn execute_supervised(
     input: &[u8],
     deadline: Duration,
 ) -> anyhow::Result<Output> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -231,7 +237,7 @@ fn execute_supervised(
         .context("extension host stdin unavailable")?
         .write_all(input);
     if let Err(error) = write_result {
-        let _ = child.kill();
+        terminate_host(&mut child);
         let _ = child.wait();
         let _ = join_output(stdout_reader, "stdout");
         let _ = join_output(stderr_reader, "stderr");
@@ -244,7 +250,7 @@ fn execute_supervised(
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(error) => {
-                let _ = child.kill();
+                terminate_host(&mut child);
                 let wait_result = child.wait();
                 let _ = join_output(stdout_reader, "stdout");
                 let _ = join_output(stderr_reader, "stderr");
@@ -253,7 +259,7 @@ fn execute_supervised(
             }
         }
         if started.elapsed() >= deadline {
-            let _ = child.kill();
+            terminate_host(&mut child);
             let wait_result = child.wait();
             let _ = join_output(stdout_reader, "stdout");
             let _ = join_output(stderr_reader, "stderr");
@@ -272,6 +278,25 @@ fn execute_supervised(
         stdout: join_output(stdout_reader, "stdout")?,
         stderr: join_output(stderr_reader, "stderr")?,
     })
+}
+
+#[cfg(unix)]
+fn terminate_host(child: &mut std::process::Child) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    // SAFETY: the child starts its own process group above, and the negative PID
+    // targets only that group. A fallback direct kill handles an exited leader.
+    unsafe {
+        kill(-(child.id() as i32), SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(windows)]
+fn terminate_host(child: &mut std::process::Child) {
+    let _ = child.kill();
 }
 
 fn execute_host_output_supervised(
@@ -627,6 +652,9 @@ fn replay_commits(
             message: &commit.message,
             response,
             anchor,
+            affected_areas: None,
+            ancestors: &[],
+            range_complete: true,
         })
         .collect::<Vec<_>>();
     store.apply_range(repo_id, &updates, false)
@@ -666,6 +694,9 @@ fn preview_commit(
             message: &commit.message,
             response: &response,
             anchor: &virtual_anchor,
+            affected_areas: None,
+            ancestors: &[],
+            range_complete: true,
         },
     )?;
     let mut diagnostics = preview.diagnostics;
@@ -734,6 +765,7 @@ pub fn check_repository_with_attention(
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or_default(),
         message: message.to_owned(),
+        changes: Vec::new(),
     });
     let proposed_nodes = proposed_commit
         .as_ref()
@@ -871,6 +903,20 @@ pub struct SyncSummary {
     pub over_capacity: bool,
     pub max_concurrency: usize,
     pub attention: AttentionUsage,
+    pub trail: NativeTrailSummary,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct NativeTrailSummary {
+    pub requested_selector: Option<String>,
+    pub resolved_oid: String,
+    pub trail_id: String,
+    pub attention_identity: String,
+    pub selected_commits: usize,
+    pub selected_nodes: usize,
+    pub extension_identity: String,
+    pub protocol_version: u32,
+    pub schema_version: u32,
 }
 
 #[derive(Debug)]
@@ -892,7 +938,19 @@ pub fn sync_repository_with_attention(
     node_limit: Option<i64>,
 ) -> anyhow::Result<SyncResult> {
     let policy = resolve_attention_policy(commit_limit, node_limit)?;
-    sync_repository_with_policy(path, trust, policy)
+    sync_repository_with_selection(path, trust, None, None, policy)
+}
+
+pub fn sync_repository_with_ref_attention(
+    path: &Path,
+    trust: Option<bool>,
+    selector: Option<&str>,
+    observed_oid: Option<&str>,
+    commit_limit: Option<i64>,
+    node_limit: Option<i64>,
+) -> anyhow::Result<SyncResult> {
+    let policy = resolve_attention_policy(commit_limit, node_limit)?;
+    sync_repository_with_selection(path, trust, selector, observed_oid, policy)
 }
 
 fn sync_repository_with_policy(
@@ -900,11 +958,26 @@ fn sync_repository_with_policy(
     trust: Option<bool>,
     policy: AttentionPolicy,
 ) -> anyhow::Result<SyncResult> {
+    sync_repository_with_selection(path, trust, None, None, policy)
+}
+
+fn sync_repository_with_selection(
+    path: &Path,
+    trust: Option<bool>,
+    selector: Option<&str>,
+    observed_oid: Option<&str>,
+    policy: AttentionPolicy,
+) -> anyhow::Result<SyncResult> {
     let home = zmem_home()?;
     let config = Config::load(&home.join("config.toml"))?;
     let repo = GitRepo::open(path)?;
     let canonical = repo.root().to_string_lossy().into_owned();
-    let head = repo.head()?;
+    let requested = selector.unwrap_or("HEAD");
+    let client_oid = observed_oid
+        .map(str::to_owned)
+        .unwrap_or(repo.resolve(requested)?);
+    let resolved = repo.resolve_observed(requested, &client_oid)?;
+    let head = resolved.oid.clone();
     let mut store = Store::open(&home.join("db").join("entries.db"))?;
     let (repo_id, trusted) = match store.repository(&canonical)? {
         Some((id, current)) => (id, trust.unwrap_or(current)),
@@ -920,90 +993,163 @@ fn sync_repository_with_policy(
     let identity = invoke_identity(&config, &home, &repo, trusted)?.extension_hash;
     let selected = select_history(&config, &mut store, &repo, &head, policy, 0)?;
     let lower_boundary = selected.commits.first().map(|commit| commit.sha.as_str());
-    let final_anchor = Anchor {
-        head: head.clone(),
-        schema: SCHEMA_VERSION,
-        extension_hash: identity.clone(),
-        attention_identity: selected.usage.view_identity(lower_boundary),
-    };
-    let anchor = store.anchor(repo_id)?;
-    let current = anchor.as_ref().is_some_and(|anchor| {
-        anchor.head == head
-            && anchor.schema == SCHEMA_VERSION
-            && anchor.extension_hash == identity
-            && anchor.attention_identity == final_anchor.attention_identity
-    });
-    let incremental = if current {
-        false
-    } else if let Some(anchor) = &anchor {
-        anchor.schema == SCHEMA_VERSION
-            && anchor.extension_hash == identity
-            && !selected.usage.truncated
-            && attention_identity_allows_incremental(&anchor.attention_identity, policy)
-            && repo.is_ancestor(&anchor.head, &head)?
-            && selected
-                .commits
-                .iter()
-                .any(|commit| commit.sha == anchor.head)
+    let attention_identity = selected.usage.view_identity(lower_boundary);
+    let identity_key = TrailIdentity::new(
+        repo_id,
+        head.clone(),
+        policy,
+        &identity,
+        zmem_core::PROTOCOL_VERSION,
+        SCHEMA_VERSION,
+    );
+    let trail_id = format!("{}:{}", identity_key.key(), attention_identity);
+    let legacy = store
+        .trails(repo_id)?
+        .into_iter()
+        .find(|trail| trail.legacy && trail.head_oid == head && selector.is_none());
+    let existing = store.trail(&trail_id)?.or(legacy);
+    let mut indexed = 0;
+    let active_trail = if let Some(existing) = existing {
+        existing
     } else {
-        false
-    };
-    let commits = if current {
-        Vec::new()
-    } else if incremental {
-        let previous = &anchor.as_ref().expect("incremental anchor exists").head;
-        selected
+        let mut expansions = std::collections::BTreeMap::new();
+        let mut missing = Vec::new();
+        for commit in &selected.commits {
+            if let Some(response) = store.expansion_fact(repo_id, &commit.sha, &identity)? {
+                expansions.insert(commit.sha.clone(), response);
+            } else {
+                missing.push(commit.clone());
+            }
+        }
+        indexed = missing.len();
+        for (commit, response) in
+            expand_commits(&config, &home, &repo, missing, trusted, true, false)
+        {
+            let response = response?;
+            anyhow::ensure!(
+                response.extension_hash == identity,
+                "extension identity changed during indexing"
+            );
+            expansions.insert(commit.sha, response);
+        }
+        let ancestors = selected
             .commits
             .iter()
-            .skip_while(|commit| commit.sha != *previous)
-            .skip(1)
-            .cloned()
-            .collect()
-    } else {
-        selected.commits.clone()
+            .map(|commit| Ok((commit.sha.clone(), repo.ancestors(&commit.sha)?)))
+            .collect::<anyhow::Result<std::collections::BTreeMap<_, _>>>()?;
+        let areas = selected
+            .commits
+            .iter()
+            .map(|commit| (commit.sha.clone(), derive_affected_areas(&commit.changes)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let final_anchor = Anchor {
+            head: head.clone(),
+            schema: SCHEMA_VERSION,
+            extension_hash: identity.clone(),
+            attention_identity: attention_identity.clone(),
+        };
+        let temporary = TemporaryStore::new()?;
+        let mut projection = Store::open(&temporary.database())?;
+        let projection_repo = projection.register_repository(&canonical, trusted)?;
+        let updates = selected
+            .commits
+            .iter()
+            .map(|commit| CommitUpdate {
+                oid: &commit.sha,
+                commit_time: commit.commit_time,
+                message: &commit.message,
+                response: expansions
+                    .get(&commit.sha)
+                    .expect("selected commit has expansion fact"),
+                anchor: &final_anchor,
+                affected_areas: areas.get(&commit.sha).and_then(Option::as_deref),
+                ancestors: ancestors
+                    .get(&commit.sha)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+                range_complete: !selected.usage.truncated,
+            })
+            .collect::<Vec<_>>();
+        projection.replace_projection(projection_repo, &updates, &final_anchor)?;
+        let entries = projection.query_entries(projection_repo, true)?;
+        let relationships = projection.query_relationships(projection_repo)?;
+        let diagnostics = projection.query_diagnostics(projection_repo)?;
+        let record = TrailRecord {
+            id: trail_id.clone(),
+            repository_id: repo_id,
+            head_oid: head.clone(),
+            attention_identity: attention_identity.clone(),
+            extension_identity: identity.clone(),
+            protocol_version: zmem_core::PROTOCOL_VERSION,
+            schema_version: SCHEMA_VERSION,
+            legacy: false,
+            selected_commit_count: selected.usage.selected_commits,
+            selected_node_count: selected.usage.selected_nodes,
+            source_time: selected
+                .commits
+                .iter()
+                .map(|commit| commit.commit_time)
+                .max()
+                .unwrap_or_default(),
+        };
+        store.publish_trail(TrailPublication {
+            trail: &record,
+            commits: &selected.commits,
+            ancestors: &ancestors,
+            entries: &entries,
+            relationships: &relationships,
+            diagnostics: &diagnostics,
+            expansions: &expansions,
+        })?;
+        record
     };
-    let expanded = expand_commits(&config, &home, &repo, commits, trusted, true, false);
-    let mut completed = Vec::with_capacity(expanded.len());
-    for (commit, response) in expanded {
-        let response = response?;
-        anyhow::ensure!(
-            response.extension_hash == identity,
-            "extension identity changed during indexing"
-        );
-        completed.push((commit, response));
+    if resolved.local_branch && selector.is_some() {
+        store.set_ref_alias(repo_id, requested, &active_trail.id, &head)?;
     }
-    let updates = completed
-        .iter()
-        .map(|(commit, response)| CommitUpdate {
-            oid: &commit.sha,
-            commit_time: commit.commit_time,
-            message: &commit.message,
-            response,
-            anchor: &final_anchor,
-        })
-        .collect::<Vec<_>>();
-    if !current {
-        if incremental {
-            store.apply_range(repo_id, &updates, false)?;
-        } else {
-            store.replace_projection(repo_id, &updates, &final_anchor)?;
-        }
-    }
-    let indexed = updates.len();
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
+    let protect_recent_seconds = i64::from(config.protect_recent_days) * 86_400;
+    let trail_cohorts = store.trail_cohorts(now, protect_recent_seconds)?;
+    let mut trail_entries = trail_cohorts.iter().map(|row| row.entries).sum::<u64>();
+    let sizes = trail_cohorts
+        .iter()
+        .map(|row| (row.trail_id.as_str(), row.entries))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut trail_evictions = Vec::new();
+    for trail_id in select_trail_evictions(&trail_cohorts) {
+        if trail_entries <= config.max_entries.get() {
+            break;
+        }
+        if trail_id == active_trail.id {
+            continue;
+        }
+        trail_entries = trail_entries.saturating_sub(sizes[trail_id.as_str()]);
+        trail_evictions.push(trail_id);
+    }
+    store.evict_trails(&trail_evictions)?;
     let plan = select_evictions(
         &store.cohorts()?,
         now,
         RetentionPolicy {
             max_entries: config.max_entries.get(),
-            protect_recent_seconds: i64::from(config.protect_recent_days) * 86_400,
+            protect_recent_seconds,
         },
     );
-    let over_capacity = plan.over_capacity;
+    let over_capacity = trail_entries > config.max_entries.get() || plan.over_capacity;
     store.evict(&plan)?;
-    let entries = store.query_entries(repo_id, true)?;
-    let relationships = store.query_relationships(repo_id)?;
-    let diagnostics = store.query_diagnostics(repo_id)?;
+    let entries = store.query_trail_entries(&active_trail.id, true)?;
+    let relationships = store.query_trail_relationships(&active_trail.id)?;
+    let diagnostics = store.query_trail_diagnostics(&active_trail.id)?;
+    let trail = NativeTrailSummary {
+        requested_selector: selector.map(str::to_owned),
+        resolved_oid: head.clone(),
+        trail_id: active_trail.id,
+        attention_identity: active_trail.attention_identity,
+        selected_commits: active_trail.selected_commit_count,
+        selected_nodes: active_trail.selected_node_count,
+        extension_identity: active_trail.extension_identity,
+        protocol_version: active_trail.protocol_version,
+        schema_version: active_trail.schema_version,
+    };
     Ok(SyncResult {
         summary: SyncSummary {
             repository: canonical,
@@ -1013,6 +1159,7 @@ fn sync_repository_with_policy(
             over_capacity,
             max_concurrency: config.max_concurrency.get(),
             attention: selected.usage,
+            trail,
         },
         entries,
         relationships,

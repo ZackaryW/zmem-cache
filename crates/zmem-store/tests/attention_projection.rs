@@ -78,6 +78,9 @@ fn replacing_a_bounded_projection_removes_stale_rows_and_sets_final_anchor() {
                 message: "zmem(DECISION): old",
                 response: &old_response,
                 anchor: &old_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             }],
             &old_anchor,
         )
@@ -95,6 +98,9 @@ fn replacing_a_bounded_projection_removes_stale_rows_and_sets_final_anchor() {
                 message: "zmem(DECISION): new",
                 response: &new_response,
                 anchor: &new_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             }],
             &new_anchor,
         )

@@ -76,6 +76,9 @@ fn seeded_store() -> (TestDb, Store, i64, HostResponse, Anchor) {
                 message: "zmem(DECISION): keep state",
                 response: &base,
                 anchor: &base_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             }],
             false,
         )
@@ -100,6 +103,9 @@ fn cancellation_preview_reports_projection_and_rolls_back() {
                 message: "zmem(CANCEL)[aaaaaaaa, 1]",
                 response: &preview,
                 anchor: &virtual_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             },
         )
         .unwrap();
@@ -132,6 +138,9 @@ fn decay_after_cancel_is_reported_as_no_op() {
                 message: "cancel",
                 response: &cancel,
                 anchor: &cancel_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             }],
             false,
         )
@@ -151,6 +160,9 @@ fn decay_after_cancel_is_reported_as_no_op() {
                 message: "decay",
                 response: &decay,
                 anchor: &virtual_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             },
         )
         .unwrap();
@@ -184,6 +196,9 @@ fn ordered_preview_effects_share_projected_state() {
                 message: "ordered",
                 response: &actions,
                 anchor: &virtual_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             },
         )
         .unwrap();
@@ -210,6 +225,9 @@ fn unresolved_preview_effect_is_rejected_with_a_diagnostic() {
                 message: "missing",
                 response: &actions,
                 anchor: &virtual_anchor,
+                affected_areas: None,
+                ancestors: &[],
+                range_complete: true,
             },
         )
         .unwrap();

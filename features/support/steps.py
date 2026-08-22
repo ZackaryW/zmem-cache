@@ -11,6 +11,7 @@ from pathlib import Path
 from behave import given, then, when
 
 from features.support.lifecycle import (
+    ZMEM_ROOT,
     assemble_test_runtime,
     commit,
     database,
@@ -272,7 +273,7 @@ def then_registered_once(context):
 def then_indexed_trusted(context):
     with database(context) as connection:
         row = connection.execute(
-            "SELECT a.head, r.trusted_extensions FROM anchors a JOIN repositories r ON r.id=a.repository_id"
+            "SELECT t.head_oid, r.trusted_extensions FROM trails t JOIN repositories r ON r.id=t.repository_id"
         ).fetchone()
     assert row == (context.head, 1) and context.first_add["indexed_commits"] == 1
 
@@ -442,9 +443,7 @@ def when_two_descendants(context):
 def then_two_expanded(context):
     _assert_success(context)
     assert context.payload["summary"]["indexed_commits"] == 2
-    with database(context) as connection:
-        anchor = connection.execute("SELECT head FROM anchors").fetchone()[0]
-    assert anchor == context.head
+    assert context.payload["summary"]["trail"]["resolved_oid"] == context.head
 
 
 @given("an indexed history that cancels a decision")
@@ -455,6 +454,7 @@ def given_cancelled_history(context):
     _query(context)
     _assert_success(context)
     assert context.payload["entries"][0]["valid"] is False
+    context.cancelled_trail_id = context.payload["summary"]["trail"]["trail_id"]
 
 
 @when("HEAD is rewritten without the cancellation")
@@ -471,7 +471,8 @@ def then_rebuilt_valid(context):
     _assert_success(context)
     decision = next(row for row in context.payload["entries"] if row["content"] == "keep")
     assert decision["valid"] is True and decision["score"] == 1.0
-    assert context.payload["summary"]["indexed_commits"] == 2
+    assert context.payload["summary"]["indexed_commits"] == 1
+    assert context.payload["summary"]["trail"]["trail_id"] != context.cancelled_trail_id
 
 
 @given("indexing fails fatally after proposing an effect")
@@ -480,6 +481,7 @@ def given_failing_range(context):
     context.base = commit(context, "zmem(DECISION): stable")
     run_svc(context, "add", str(context.repo))
     _assert_success(context)
+    context.base_trail_count = 1
     commit(context, f"zmem(DECAY)[{context.base[:8]}, 1, 0.5]")
     write_global_extension(
         context,
@@ -499,9 +501,9 @@ def when_range_fails(context):
 def then_range_atomic(context):
     assert context.completed.returncode != 0
     with database(context) as connection:
-        anchor = connection.execute("SELECT head FROM anchors").fetchone()[0]
+        trail_count = connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0]
         score = connection.execute("SELECT score FROM entries WHERE content='stable'").fetchone()[0]
-    assert anchor == context.base and score == 1.0
+    assert trail_count == context.base_trail_count and score == 1.0
 
 
 @given("more ready commit work than max_concurrency")
@@ -691,6 +693,7 @@ def given_bad_protocol_host(context):
     context.anchor = commit(context, "zmem(DECISION): stable")
     run_svc(context, "add", str(context.repo))
     _assert_success(context)
+    context.protocol_initial_trails = 1
     run_svc(context, "stop")
     script = context.temp_root / "bad_host.py"
     script.write_text(
@@ -717,8 +720,9 @@ def when_bad_range_indexed(context):
 def then_protocol_anchor_unchanged(context):
     assert context.completed.returncode != 0
     with database(context) as connection:
-        anchor = connection.execute("SELECT head FROM anchors").fetchone()[0]
-    assert anchor == context.anchor
+        trails = connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0]
+        heads = {row[0] for row in connection.execute("SELECT head_oid FROM trails")}
+    assert trails == context.protocol_initial_trails and heads == {context.anchor}
 
 
 @given("an anchor containing the previous extension-set identity")
@@ -727,17 +731,20 @@ def given_previous_identity(context):
         context,
         "expanders",
         "custom.py",
-        "API_VERSION=1\nVALUE=1\ndef register(registry, mode='extend'): pass\n",
+        "API_VERSION=1\nVALUE='one'\nclass Custom:\n extension_id='CUSTOM'\n def expand(self, context): context.add_entry(type='CUSTOM', content=VALUE)\ndef register(registry, mode='extend'): registry.extend('CUSTOM', Custom())\n",
     )
     init_repo(context)
-    commit(context, "zmem(DECISION): stable")
+    commit(context, "zmem(CUSTOM): stable")
     _query(context)
     _assert_success(context)
+    assert context.payload["entries"][0]["content"] == "one"
 
 
 @when("the current extension host reports a different identity")
 def when_identity_changes(context):
-    context.extension.write_text("API_VERSION=1\nVALUE=2\ndef register(registry, mode='extend'): pass\n")
+    context.extension.write_text(
+        "API_VERSION=1\nVALUE='second'\nclass Custom:\n extension_id='CUSTOM'\n def expand(self, context): context.add_entry(type='CUSTOM', content=VALUE)\ndef register(registry, mode='extend'): registry.extend('CUSTOM', Custom())\n"
+    )
     _query(context)
 
 
@@ -745,7 +752,7 @@ def when_identity_changes(context):
 def then_rebuild_selected(context):
     _assert_success(context)
     assert context.payload["summary"]["indexed_commits"] == 1
-    assert len(context.payload["entries"]) == 1
+    assert len(context.payload["entries"]) == 1 and context.payload["entries"][0]["content"] == "second"
 
 
 @given("valid expansion output and a failing hook diagnostic")
@@ -820,6 +827,9 @@ elif operation == 'expand':
     if MODE == 'expansion_fail':
         count_attempt()
         raise SystemExit(9)
+    if MODE == 'bypass':
+        response(extension_hash='fake-host', journal={{'version': 1, 'origin': 'zmem-expansion-context', 'actions': []}}, hook_diagnostics=[], annotation_count=1, entries=[{{'content': 'bypass'}}])
+        raise SystemExit(0)
     if MODE == 'concurrency':
         connection = sqlite3.connect(STATE, timeout=10)
         connection.execute('CREATE TABLE IF NOT EXISTS state(active INTEGER NOT NULL, maximum INTEGER NOT NULL)')
@@ -872,6 +882,7 @@ def given_timed_host(context):
     context.anchor_before_timeout = commit(context, "zmem(DECISION): stable")
     _query(context)
     _assert_success(context)
+    context.timeout_initial_trails = 1
     commit(context, "zmem(DECISION): must not land")
     _configure_observable_host(context, "timeout")
 
@@ -892,7 +903,8 @@ def then_timeout_reaped_and_atomic(context):
     pid = int(context.host_state.read_text())
     assert not _process_exists(pid)
     with database(context) as connection:
-        assert connection.execute("SELECT head FROM anchors").fetchone()[0] == context.anchor_before_timeout
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == context.timeout_initial_trails
+        assert connection.execute("SELECT head_oid FROM trails").fetchone()[0] == context.anchor_before_timeout
 
 
 @given("a parser-only host that fails its first attempt and succeeds its second")
@@ -934,7 +946,7 @@ def then_expansion_not_retried(context):
 @then("the failed range does not advance its anchor")
 def then_failed_expansion_has_no_anchor(context):
     with database(context) as connection:
-        assert connection.execute("SELECT COUNT(*) FROM anchors").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 0
 
 
 @given("selected history whose inspection host omits one batch result")
@@ -950,7 +962,7 @@ def then_incomplete_batch_rejected(context):
     assert context.completed.returncode != 0
     with database(context) as connection:
         assert connection.execute("SELECT COUNT(*) FROM inspections").fetchone()[0] == 0
-        assert connection.execute("SELECT COUNT(*) FROM anchors").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 0
 
 
 @given("selected history with multiple uncached commit messages")
@@ -1040,6 +1052,7 @@ def given_stale_parser_inspections(context):
 
 @when("the repository is queried under the current parser identity")
 def when_current_parser_queries(context):
+    commit(context, "", subject="docs: advance parser view")
     _query(context)
 
 
@@ -1047,10 +1060,8 @@ def when_current_parser_queries(context):
 def then_stale_inspections_replaced(context):
     _assert_success(context)
     with database(context) as connection:
-        current = connection.execute(
-            "SELECT COUNT(*) FROM inspections WHERE parser_protocol=3"
-        ).fetchone()[0]
-    assert current == len(context.stale_inspection_shas)
+        current = connection.execute("SELECT COUNT(*) FROM inspections WHERE parser_protocol=4").fetchone()[0]
+    assert current >= len(context.stale_inspection_shas)
 
 
 @given("a repository with one supported annotation")
@@ -1205,8 +1216,7 @@ def then_unlimited_rebuild_returns_old(context):
 
 @then("the anchor reports a complete attention identity")
 def then_anchor_complete_attention(context):
-    with database(context) as connection:
-        identity = connection.execute("SELECT attention_identity FROM anchors").fetchone()[0]
+    identity = context.payload["summary"]["trail"]["attention_identity"]
     assert identity.startswith("v1:-1:-1:") and ":false:" in identity
 
 
@@ -1288,3 +1298,803 @@ def then_deep_unlimited_cancel(context):
     effect = context.payload["effects"][0]
     assert effect["before_valid"] is True and effect["after_valid"] is False
     assert context.payload["attention"]["truncated"] is False
+
+
+def _git(context, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", context.repo, *args],
+        env=context.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, (completed.stdout, completed.stderr)
+    return completed.stdout.strip()
+
+
+def _query_selector(context, selector: str, observed: str, *, node_limit: int | None = None) -> dict | None:
+    args = [
+        "query",
+        str(context.repo),
+        "--include-invalid",
+        "--ref",
+        selector,
+        "--observed-oid",
+        observed,
+    ]
+    if node_limit is not None:
+        args.extend(("--node-limit", str(node_limit)))
+    run_svc(context, *args)
+    return context.payload
+
+
+@given("two local branches at one commit under identical trail identities")
+def given_two_names_one_commit(context):
+    init_repo(context)
+    context.shared_head = commit(context, "zmem(DECISION): shared trail")
+    _git(context, "branch", "alpha", context.shared_head)
+    _git(context, "branch", "beta", context.shared_head)
+
+
+@when("both branches are queried")
+def when_query_two_names(context):
+    context.trail_results = [_query_selector(context, selector, context.shared_head) for selector in ("alpha", "beta")]
+    assert all(result is not None for result in context.trail_results)
+
+
+@then("both selectors reuse one immutable trail")
+def then_two_names_one_trail(context):
+    trails = [result["summary"]["trail"] for result in context.trail_results]
+    assert trails[0]["trail_id"] == trails[1]["trail_id"]
+    assert [trail["requested_selector"] for trail in trails] == ["alpha", "beta"]
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 1
+
+
+@given("a cached local branch alias whose branch has moved")
+def given_stale_branch_alias(context):
+    init_repo(context)
+    context.old_head = commit(context, "zmem(DECISION): old branch state")
+    _git(context, "branch", "moving", context.old_head)
+    first = _query_selector(context, "moving", context.old_head)
+    assert first is not None
+    context.old_trail = first["summary"]["trail"]["trail_id"]
+    _git(context, "switch", "moving")
+    context.new_head = commit(context, "zmem(LESSON_LEARNT): new branch state")
+
+
+@when("the branch is queried using its live commit identity")
+def when_query_live_branch(context):
+    context.live_result = _query_selector(context, "moving", context.new_head)
+    _assert_success(context)
+
+
+@then("the stale alias is ignored and the live trail is returned")
+def then_stale_alias_ignored(context):
+    trail = context.live_result["summary"]["trail"]
+    assert trail["resolved_oid"] == context.new_head and trail["trail_id"] != context.old_trail
+    with database(context) as connection:
+        alias = connection.execute("SELECT trail_id,resolved_oid FROM ref_aliases WHERE selector='moving'").fetchone()
+    assert alias == (trail["trail_id"], context.new_head)
+
+
+@given("a ref that moves after the client observes its commit")
+def given_ref_race(context):
+    init_repo(context)
+    context.observed_head = commit(context, "zmem(DECISION): observed")
+    context.branch = _git(context, "branch", "--show-current")
+    context.live_head = commit(context, "zmem(LESSON_LEARNT): moved")
+
+
+@when("the service resolves that ref for the request")
+def when_resolve_stale_ref(context):
+    _query_selector(context, context.branch, context.observed_head)
+
+
+@then("the request fails without publishing or advancing a trail")
+def then_stale_ref_atomic(context):
+    assert context.completed.returncode != 0
+    assert "stale ref" in context.completed.stderr
+    db_path = context.home / "db" / "entries.db"
+    if db_path.exists():
+        with sqlite3.connect(db_path) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 0
+
+
+@given("two trails sharing a decision while only one reaches its cancellation")
+def given_branch_local_cancel(context):
+    init_repo(context)
+    context.decision_sha = commit(context, "zmem(DECISION): branch-local validity")
+    _git(context, "branch", "valid", context.decision_sha)
+    _git(context, "switch", "-c", "cancelled")
+    context.cancelled_head = commit(context, f"zmem(CANCEL)[{context.decision_sha[:10]}, 1]")
+
+
+@when("both trails are queried including invalid entries")
+def when_query_cancelled_and_valid(context):
+    context.cancelled_result = _query_selector(context, "cancelled", context.cancelled_head)
+    context.valid_result = _query_selector(context, "valid", context.decision_sha)
+    assert context.cancelled_result is not None and context.valid_result is not None
+
+
+@then("the shared decision is invalid only on the cancellation trail")
+def then_cancel_is_trail_local(context):
+    cancelled = context.cancelled_result["entries"][0]
+    valid = context.valid_result["entries"][0]
+    assert cancelled["sha"] == valid["sha"] == context.decision_sha
+    assert cancelled["valid"] is False and valid["valid"] is True
+
+
+@given("a candidate trail containing an incomplete META range")
+def given_incomplete_meta_trail(context):
+    init_repo(context)
+    context.target_sha = commit(context, "zmem(DECISION): unchanged target")
+    context.meta_head = commit(
+        context,
+        f"zmem(META)[{context.target_sha[:10]}, {context.target_sha[:10]}, owner=team]",
+    )
+    context.branch = _git(context, "branch", "--show-current")
+
+
+@when("that trail is constructed")
+def when_construct_incomplete_meta(context):
+    _query_selector(context, context.branch, context.meta_head, node_limit=1)
+
+
+@then("neither the candidate trail nor partial metadata becomes visible")
+def then_incomplete_meta_is_atomic(context):
+    assert context.completed.returncode != 0
+    assert "complete" in context.completed.stderr.lower()
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM metadata_assignments").fetchone()[0] == 0
+
+
+@given("a populated schema-three cache with a materialized projection")
+def given_schema_three_projection(context):
+    init_repo(context)
+    context.legacy_oid = commit(context, "zmem(DECISION): legacy")
+    db_path = context.home / "db" / "entries.db"
+    db_path.parent.mkdir(parents=True)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys=ON;
+            PRAGMA user_version=3;
+            CREATE TABLE repositories(id INTEGER PRIMARY KEY,path TEXT NOT NULL UNIQUE,trusted_extensions INTEGER NOT NULL DEFAULT 0);
+            CREATE TABLE anchors(repository_id INTEGER PRIMARY KEY REFERENCES repositories(id) ON DELETE CASCADE,head TEXT NOT NULL,schema_version INTEGER NOT NULL,extension_hash TEXT NOT NULL,attention_identity TEXT NOT NULL);
+            CREATE TABLE commits(repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,oid TEXT NOT NULL,commit_time INTEGER NOT NULL,message TEXT NOT NULL,PRIMARY KEY(repository_id,oid));
+            CREATE TABLE entries(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,annotation_index INTEGER NOT NULL,entry_type TEXT NOT NULL,content TEXT NOT NULL,score REAL NOT NULL,valid INTEGER NOT NULL,commit_time INTEGER NOT NULL DEFAULT 0,scope TEXT,PRIMARY KEY(repository_id,commit_oid,annotation_index),FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
+            CREATE TABLE relationships(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,source TEXT NOT NULL,target TEXT NOT NULL,score REAL NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
+            CREATE TABLE diagnostics(repository_id INTEGER NOT NULL,commit_oid TEXT NOT NULL,message TEXT NOT NULL,FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE);
+            CREATE TABLE inspections(commit_oid TEXT NOT NULL,parser_protocol INTEGER NOT NULL,annotation_count INTEGER NOT NULL,parser_diagnostics TEXT NOT NULL,PRIMARY KEY(commit_oid,parser_protocol));
+            """
+        )
+        connection.execute("INSERT INTO repositories VALUES(1,?1,0)", [str(context.repo.resolve())])
+        connection.execute("INSERT INTO commits VALUES(1,?1,10,'zmem(DECISION): legacy')", [context.legacy_oid])
+        connection.execute(
+            "INSERT INTO entries VALUES(1,?1,1,'DECISION','legacy',1.0,1,10,NULL)",
+            [context.legacy_oid],
+        )
+        connection.execute(
+            "INSERT INTO anchors VALUES(1,?1,3,'legacy-extension','legacy-attention')",
+            [context.legacy_oid],
+        )
+
+
+@when("the compatible service opens the database")
+def when_service_migrates_cache(context):
+    run_svc(context, "query", str(context.repo), "--include-invalid")
+    _assert_success(context)
+
+
+@then("a legacy trail preserves its query state without Git replay")
+def then_legacy_trail_preserved(context):
+    assert context.payload["summary"]["indexed_commits"] == 0
+    assert context.payload["entries"][0]["content"] == "legacy"
+    assert context.payload["entries"][0]["affected_areas"] is None
+    with database(context) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("SELECT legacy FROM trails").fetchone()[0] == 1
+
+
+@given("memory reachable from a detached commit identity")
+def given_detached_memory(context):
+    init_repo(context)
+    context.detached_oid = commit(context, "zmem(DECISION): detached")
+
+
+@when("that commit is queried directly")
+def when_query_detached_oid(context):
+    context.detached_result = _query_selector(context, context.detached_oid, context.detached_oid)
+    _assert_success(context)
+
+
+@then("the response identifies its immutable trail without a local branch alias")
+def then_detached_has_no_alias(context):
+    trail = context.detached_result["summary"]["trail"]
+    assert trail["requested_selector"] == context.detached_oid
+    assert trail["resolved_oid"] == context.detached_oid
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM ref_aliases").fetchone()[0] == 0
+
+
+def _commit_files(context, body: str, files: dict[str, str], *, subject: str = "feat: paths") -> str:
+    for relative, content in files.items():
+        path = context.repo / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    _git(context, "add", "-A")
+    args = ["commit", "-q", "-m", subject]
+    if body:
+        args.extend(("-m", body))
+    _git(context, *args)
+    return _git(context, "rev-parse", "HEAD")
+
+
+@given("two trails sharing an entry and only one containing a META owner assignment")
+def given_branch_owner_override(context):
+    init_repo(context)
+    context.owner_target = commit(context, "zmem(DECISION): shared owner target")
+    _git(context, "branch", "plain", context.owner_target)
+    _git(context, "switch", "-c", "owned")
+    context.owned_head = commit(
+        context,
+        f"zmem(META)[{context.owner_target[:10]}, {context.owner_target[:10]}, owner=platform]",
+    )
+
+
+@when("both trails are queried")
+def when_query_owner_trails(context):
+    context.owned_result = _query_selector(context, "owned", context.owned_head)
+    context.plain_result = _query_selector(context, "plain", context.owner_target)
+    assert context.owned_result is not None and context.plain_result is not None
+
+
+@then("only the META-containing trail reports the assigned owner")
+def then_owner_is_trail_local(context):
+    assert context.owned_result["entries"][0]["owner"] == "platform"
+    assert context.plain_result["entries"][0]["owner"] is None
+
+
+@given("a new commit renaming a file from a/old to b/sub/new")
+def given_cross_area_rename(context):
+    init_repo(context)
+    _commit_files(context, "", {"a/old": "old\n"})
+    (context.repo / "b" / "sub").mkdir(parents=True)
+    _git(context, "mv", "a/old", "b/sub/new")
+    _git(context, "commit", "-q", "-m", "feat: rename", "-m", "zmem(DECISION): renamed")
+    context.rename_head = _git(context, "rev-parse", "HEAD")
+
+
+@when("its shared commit fact enters the cache")
+def when_index_renamed_fact(context):
+    head = getattr(context, "rename_head", None) or context.broad_head
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", head)
+    _assert_success(context)
+
+
+@then("affected-area derivation includes a and b/sub")
+def then_rename_has_both_areas(context):
+    entry = next(row for row in context.payload["entries"] if row["sha"] == context.rename_head)
+    assert entry["affected_areas"] == ["a", "b/sub"]
+
+
+@given("a new commit whose compact derivation has four areas")
+def given_four_area_commit(context):
+    init_repo(context)
+    context.broad_head = _commit_files(
+        context,
+        "zmem(DECISION): broad change",
+        {"a/x": "a", "b/x": "b", "c/x": "c", "d/x": "d"},
+    )
+
+
+@then("its affected areas are null and globally applicable")
+def then_broad_fact_is_global(context):
+    entry = next(row for row in context.payload["entries"] if row["sha"] == context.broad_head)
+    assert entry["affected_areas"] is None
+
+
+@given("a migrated legacy entry without an affected-area override")
+def given_migrated_global_entry(context):
+    given_schema_three_projection(context)
+    when_service_migrates_cache(context)
+
+
+@when("the trail is queried with any affected-area filter")
+def when_query_migrated_area(context):
+    zmem = ZMEM_ROOT / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "zmem"
+    context.env["ZMEM_SVC"] = str(context.svc)
+    context.completed = subprocess.run(
+        [zmem, "--repo", context.repo, "recall", "--area", "some/subtree"],
+        env=context.env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    context.payload = json.loads(context.completed.stdout)
+
+
+@then("the entry reports null affected areas and remains visible")
+def then_migrated_entry_matches_area(context):
+    _assert_success(context)
+    assert context.payload["count"] == 1
+    assert context.payload["results"][0]["affected_areas"] is None
+
+
+@given("a trail with metadata targets in a complete range")
+def given_complete_metadata_target(context):
+    init_repo(context)
+    context.scalar_target = commit(context, "zmem(DECISION): scalar target")
+
+
+@when("META attempts to append to scalar owner")
+def when_meta_appends_scalar(context):
+    context.invalid_meta_head = commit(
+        context,
+        f"zmem(META)[{context.scalar_target[:10]}, {context.scalar_target[:10]}, owner+=team]",
+    )
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.invalid_meta_head)
+    _assert_success(context)
+
+
+@then("no target metadata changes and the invalid operation is diagnosed")
+def then_scalar_append_diagnosed(context):
+    target = next(row for row in context.payload["entries"] if row["sha"] == context.scalar_target)
+    assert target["owner"] is None
+    assert any("invalid META" in diagnostic["message"] for diagnostic in context.payload["diagnostics"])
+
+
+@given("a META range spanning commits on a merged branch")
+def given_merged_meta_range(context):
+    init_repo(context)
+    context.range_from = commit(context, "zmem(DECISION): range base")
+    base_branch = _git(context, "branch", "--show-current")
+    _git(context, "switch", "-c", "side")
+    context.side_entry = _commit_files(
+        context,
+        "zmem(LESSON_LEARNT): side entry",
+        {"side/memory.txt": "side\n"},
+    )
+    _git(context, "switch", base_branch)
+    context.main_entry = _commit_files(
+        context,
+        "zmem(LESSON_LEARNT): main entry",
+        {"main/memory.txt": "main\n"},
+    )
+    _git(context, "merge", "--no-ff", "-m", "merge side", "side")
+    context.range_to = _git(context, "rev-parse", "HEAD")
+    context.range_head = commit(
+        context,
+        f"zmem(META)[{context.range_from[:10]}, {context.range_to[:10]}, owner=merged]",
+    )
+
+
+@when("the selected trail applies the metadata patch")
+def when_apply_merged_range(context):
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.range_head)
+    _assert_success(context)
+
+
+@then("every qualifying descendant and ancestor in the inclusive range is patched")
+def then_merged_range_is_inclusive(context):
+    by_sha = {row["sha"]: row for row in context.payload["entries"]}
+    for oid in (context.range_from, context.side_entry, context.main_entry):
+        assert by_sha[oid]["owner"] == "merged"
+
+
+@given("concurrent META assignments conflict before a merge")
+def given_concurrent_metadata(context):
+    init_repo(context)
+    context.conflict_target = commit(context, "zmem(DECISION): conflict target")
+    base_branch = _git(context, "branch", "--show-current")
+    _git(context, "switch", "-c", "owner-b")
+    context.owner_b = _commit_files(
+        context,
+        f"zmem(META)[{context.conflict_target[:10]}, {context.conflict_target[:10]}, owner=beta]",
+        {"owner-b.txt": "beta\n"},
+    )
+    _git(context, "switch", base_branch)
+    context.owner_a = _commit_files(
+        context,
+        f"zmem(META)[{context.conflict_target[:10]}, {context.conflict_target[:10]}, owner=alpha]",
+        {"owner-a.txt": "alpha\n"},
+    )
+    _git(context, "merge", "--no-ff", "-m", "merge owners", "owner-b")
+    context.conflict_merge = _git(context, "rev-parse", "HEAD")
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.conflict_merge)
+    _assert_success(context)
+    target = next(row for row in context.payload["entries"] if row["sha"] == context.conflict_target)
+    assert target["owner"] is None and target["metadata_conflicts"] == ["owner"]
+
+
+@when("a descendant META assigns that key after the merge")
+def when_descendant_resolves_metadata(context):
+    context.resolved_head = commit(
+        context,
+        f"zmem(META)[{context.conflict_target[:10]}, {context.conflict_target[:10]}, owner=resolved]",
+    )
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.resolved_head)
+    _assert_success(context)
+
+
+@then("the descendant value is reported and the conflict is cleared")
+def then_metadata_conflict_cleared(context):
+    target = next(row for row in context.payload["entries"] if row["sha"] == context.conflict_target)
+    assert target["owner"] == "resolved" and target["metadata_conflicts"] == []
+
+
+@given("a selected commit with a supported entry, unsupported annotation, and valid effect")
+def given_mixed_trail_annotations(context):
+    init_repo(context)
+    context.mixed_target = commit(context, "zmem(DECISION): mixed target")
+    context.mixed_head = commit(
+        context,
+        "\n".join(
+            (
+                "zmem(LESSON_LEARNT): supported",
+                "zmem(UNKNOWN): unsupported",
+                f"zmem(DECAY)[{context.mixed_target[:10]}, 1, 0.5]",
+            )
+        ),
+    )
+
+
+@when("its immutable trail is indexed")
+def when_index_mixed_trail(context):
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.mixed_head)
+    _assert_success(context)
+
+
+@then("all annotations consume attention, only the entry consumes capacity, and the effect updates trail state")
+def then_mixed_trail_counts(context):
+    assert context.payload["summary"]["attention"]["selected_nodes"] == 4
+    assert len(context.payload["entries"]) == 2
+    target = next(row for row in context.payload["entries"] if row["sha"] == context.mixed_target)
+    assert target["score"] == 0.5
+    assert any("unsupported" in row["message"].lower() for row in context.payload["diagnostics"])
+
+
+@given("a retained trail whose branch advances by two commits")
+def given_advancing_retained_trail(context):
+    init_repo(context)
+    context.advance_base = commit(context, "zmem(DECISION): shared base")
+    context.advance_branch = _git(context, "branch", "--show-current")
+    first = _query_selector(context, context.advance_branch, context.advance_base)
+    assert first is not None
+    context.advance_old_trail = first["summary"]["trail"]["trail_id"]
+    commit(context, "zmem(LESSON_LEARNT): advance one")
+    context.advance_head = commit(context, "zmem(LESSON_LEARNT): advance two")
+
+
+@when("the advanced branch is queried under the same compatible view")
+def when_query_advanced_trail(context):
+    context.advance_result = _query_selector(context, context.advance_branch, context.advance_head)
+    _assert_success(context)
+
+
+@then("a distinct trail reuses prior shared facts and indexes the new commits")
+def then_advanced_trail_reuses_facts(context):
+    trail = context.advance_result["summary"]["trail"]
+    assert trail["trail_id"] != context.advance_old_trail
+    assert context.advance_result["summary"]["indexed_commits"] == 2
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM expansion_facts").fetchone()[0] == 3
+
+
+@given("a retained trail reaching a cancellation and a rewritten branch without it")
+def given_rewritten_cancel_trail(context):
+    init_repo(context)
+    context.rewrite_target = commit(context, "zmem(DECISION): rewrite target")
+    context.rewrite_branch = _git(context, "branch", "--show-current")
+    context.cancel_head = commit(context, f"zmem(CANCEL)[{context.rewrite_target[:10]}, 1]")
+    cancelled = _query_selector(context, context.rewrite_branch, context.cancel_head)
+    assert cancelled is not None and cancelled["entries"][0]["valid"] is False
+    context.cancel_trail = cancelled["summary"]["trail"]["trail_id"]
+    _git(context, "reset", "--hard", context.rewrite_target)
+    context.rewritten_head = _commit_files(
+        context,
+        "zmem(LESSON_LEARNT): replacement",
+        {"replacement.txt": "replacement\n"},
+    )
+
+
+@when("the rewritten branch is queried")
+def when_query_rewritten_branch(context):
+    context.rewritten_result = _query_selector(context, context.rewrite_branch, context.rewritten_head)
+    _assert_success(context)
+    context.former_result = _query_selector(context, context.cancel_head, context.cancel_head)
+    _assert_success(context)
+
+
+@then("its new trail reports the uncancelled state while the former trail stays immutable")
+def then_rewrite_keeps_old_trail(context):
+    current = next(row for row in context.rewritten_result["entries"] if row["sha"] == context.rewrite_target)
+    former = next(row for row in context.former_result["entries"] if row["sha"] == context.rewrite_target)
+    assert current["valid"] is True and former["valid"] is False
+    assert context.former_result["summary"]["trail"]["trail_id"] == context.cancel_trail
+
+
+@given("only a default-bounded trail for a repository")
+def given_default_bounded_trail(context):
+    init_repo(context)
+    annotations = "\n".join(f"zmem(LESSON_LEARNT): node {index}" for index in range(401))
+    context.large_head = commit(context, annotations)
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.large_head)
+    _assert_success(context)
+    context.bounded_summary = context.payload["summary"]
+    assert context.bounded_summary["attention"]["truncated"] is True
+
+
+@when("the repository is queried with unlimited commit and node attention")
+def when_query_unlimited_trail(context):
+    run_svc(
+        context,
+        "query",
+        str(context.repo),
+        "--include-invalid",
+        "--observed-oid",
+        context.large_head,
+        "--commit-limit",
+        "-1",
+        "--node-limit",
+        "-1",
+    )
+    _assert_success(context)
+
+
+@then("a complete-history trail is constructed instead of reusing the bounded view as complete")
+def then_unlimited_trail_is_distinct(context):
+    assert context.payload["summary"]["attention"]["truncated"] is False
+    assert context.payload["summary"]["trail"]["trail_id"] != context.bounded_summary["trail"]["trail_id"]
+    assert len(context.payload["entries"]) == 401
+
+
+@given("a candidate trail with a fatal effect failure")
+def given_fatal_effect_trail(context):
+    given_incomplete_meta_trail(context)
+
+
+@when("indexing reaches that effect")
+def when_index_fatal_effect(context):
+    when_construct_incomplete_meta(context)
+
+
+@then("neither partial target state nor a partial trail is visible")
+def then_fatal_effect_is_atomic(context):
+    then_incomplete_meta_is_atomic(context)
+
+
+@given("an extension host reporting an incompatible trail protocol")
+def given_trail_protocol_mismatch(context):
+    given_bad_protocol_host(context)
+    with database(context) as connection:
+        context.protocol_fact_count = connection.execute("SELECT COUNT(*) FROM expansion_facts").fetchone()[0]
+        context.protocol_trail_count = connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0]
+
+
+@when("the service requests expansion for a candidate trail")
+def when_request_bad_protocol_trail(context):
+    _query(context)
+
+
+@then("construction fails without publishing shared facts or trail state")
+def then_bad_protocol_publishes_nothing(context):
+    assert context.completed.returncode != 0
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM expansion_facts").fetchone()[0] == context.protocol_fact_count
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == context.protocol_trail_count
+
+
+@given("a host journal containing a validated ordered metadata-patch action")
+def given_metadata_patch_journal(context):
+    init_repo(context)
+    context.journal_target = commit(context, "zmem(DECISION): journal target")
+    context.journal_head = commit(
+        context,
+        f"zmem(META)[{context.journal_target[:10]}, {context.journal_target[:10]}, owner=journal]",
+    )
+
+
+@when("the service constructs its selected trail")
+def when_construct_metadata_journal_trail(context):
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.journal_head)
+    _assert_success(context)
+
+
+@then("the service validates and atomically applies the complete metadata range")
+def then_metadata_journal_applied(context):
+    target = next(row for row in context.payload["entries"] if row["sha"] == context.journal_target)
+    assert target["owner"] == "journal"
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM trail_metadata WHERE owner='journal'").fetchone()[0] == 1
+
+
+@given("a host response containing data absent from its validated action journal")
+def given_bypass_host_response(context):
+    init_repo(context)
+    commit(context, "zmem(DECISION): bypass attempt")
+    _configure_observable_host(context, "bypass")
+
+
+@then("it rejects the response without publishing the candidate trail")
+def then_bypass_response_rejected(context):
+    assert context.completed.returncode != 0
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 0
+
+
+@given("a registered repository whose observed HEAD has advanced")
+def given_observed_advanced_head(context):
+    given_advanced_repo(context)
+
+
+@when("that exact observed commit is queried")
+def when_query_exact_observed_head(context):
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.head)
+    _assert_success(context)
+
+
+@then("the service returns an immutable trail through that commit")
+def then_exact_head_trail(context):
+    assert context.payload["summary"]["trail"]["resolved_oid"] == context.head
+    assert context.payload["summary"]["trail"]["trail_id"]
+
+
+@given("a resolvable tag, branch, or commit that is not checked out")
+def given_unchecked_selector(context):
+    init_repo(context)
+    context.unchecked_oid = commit(context, "zmem(DECISION): unchecked")
+    _git(context, "branch", "unoccupied", context.unchecked_oid)
+    commit(context, "zmem(LESSON_LEARNT): checked out")
+    context.worktree_before = _git(context, "status", "--porcelain=v1", "--branch")
+
+
+@when("the selector and observed identity are queried")
+def when_query_unchecked_selector(context):
+    context.unchecked_result = _query_selector(context, "unoccupied", context.unchecked_oid)
+    _assert_success(context)
+
+
+@then("the compatible trail is returned without modifying the worktree")
+def then_unchecked_selector_does_not_checkout(context):
+    assert context.unchecked_result["summary"]["trail"]["resolved_oid"] == context.unchecked_oid
+    assert _git(context, "status", "--porcelain=v1", "--branch") == context.worktree_before
+
+
+@given("capacity is exceeded by old unreferenced trail state sharing commit facts")
+def given_unreferenced_trail_capacity(context):
+    write_config(context, max_entries=2, protect_recent_days=0)
+    init_repo(context)
+    context.retention_base = commit(
+        context,
+        "zmem(DECISION): retained shared fact",
+        timestamp="2000-01-01T00:00:00+00:00",
+    )
+    main = _git(context, "branch", "--show-current")
+    _git(context, "branch", "secondary", context.retention_base)
+    first = _query_selector(context, main, context.retention_base)
+    assert first is not None
+    context.unreferenced_trail = first["summary"]["trail"]["trail_id"]
+    context.main_head = commit(
+        context,
+        "zmem(LESSON_LEARNT): main retained",
+        timestamp="2001-01-01T00:00:00+00:00",
+    )
+    _query_selector(context, main, context.main_head)
+    _git(context, "switch", "secondary")
+    context.secondary_head = _commit_files(
+        context,
+        "zmem(LESSON_LEARNT): secondary retained",
+        {"secondary.txt": "secondary\n"},
+    )
+
+
+@when("retention runs after a write")
+def when_retention_runs_after_write(context):
+    context.retention_result = _query_selector(context, "secondary", context.secondary_head)
+    _assert_success(context)
+
+
+@then("unreferenced trail state is evicted before facts used by a retained trail")
+def then_unreferenced_trail_first(context):
+    with database(context) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM trails WHERE id=?1", [context.unreferenced_trail]).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM commits WHERE oid=?1", [context.retention_base]).fetchone()[0] == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM expansion_facts WHERE commit_oid=?1", [context.retention_base]
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@given("an old shared commit fact reused by a new trail")
+def given_old_fact_reused(context):
+    init_repo(context)
+    context.old_fact = commit(
+        context,
+        "zmem(DECISION): old source fact",
+        timestamp="2000-01-01T00:00:00+00:00",
+    )
+    context.old_source_time = int(_git(context, "show", "-s", "--format=%ct", context.old_fact))
+    branch = _git(context, "branch", "--show-current")
+    _query_selector(context, branch, context.old_fact)
+    context.new_fact_head = commit(
+        context,
+        "zmem(LESSON_LEARNT): new trail",
+        timestamp="2020-01-01T00:00:00+00:00",
+    )
+
+
+@when("retention orders eligible shared facts")
+def when_retention_orders_reused_fact(context):
+    branch = _git(context, "branch", "--show-current")
+    _query_selector(context, branch, context.new_fact_head)
+    _assert_success(context)
+
+
+@then("reuse does not make the fact newer than its source commit time")
+def then_reuse_keeps_source_time(context):
+    with database(context) as connection:
+        stored = connection.execute("SELECT commit_time FROM commits WHERE oid=?1", [context.old_fact]).fetchone()[0]
+        facts = connection.execute(
+            "SELECT COUNT(*) FROM expansion_facts WHERE commit_oid=?1", [context.old_fact]
+        ).fetchone()[0]
+    assert stored == context.old_source_time and facts == 1
+
+
+@given("overlapping facts in a retained trail and an old unreferenced trail")
+def given_overlapping_retained_facts(context):
+    write_config(context, max_entries=2, protect_recent_days=0)
+    init_repo(context)
+    context.overlap_target = commit(
+        context,
+        "zmem(DECISION): overlap target",
+        timestamp="2000-01-01T00:00:00+00:00",
+    )
+    main = _git(context, "branch", "--show-current")
+    _git(context, "branch", "secondary", context.overlap_target)
+    base = _query_selector(context, main, context.overlap_target)
+    assert base is not None
+    context.overlap_old_trail = base["summary"]["trail"]["trail_id"]
+    context.decay_head = commit(
+        context,
+        f"zmem(DECAY)[{context.overlap_target[:10]}, 1, 0.5]",
+        timestamp="2001-01-01T00:00:00+00:00",
+    )
+    retained = _query_selector(context, main, context.decay_head)
+    assert retained is not None and retained["entries"][0]["score"] == 0.5
+    context.retained_selector = main
+    context.retained_trail = retained["summary"]["trail"]["trail_id"]
+    _git(context, "switch", "secondary")
+    context.secondary_overlap_head = _commit_files(
+        context,
+        "zmem(LESSON_LEARNT): secondary overlap",
+        {"secondary-overlap.txt": "secondary\n"},
+    )
+
+
+@when("the old trail is evicted and the retained trail is queried")
+def when_evict_old_and_query_retained(context):
+    _query_selector(context, "secondary", context.secondary_overlap_head)
+    context.retained_again = _query_selector(context, context.retained_selector, context.decay_head)
+    _assert_success(context)
+
+
+@then("the retained state is reused without duplicate effect application")
+def then_retained_effect_not_duplicated(context):
+    assert context.retained_again["summary"]["trail"]["trail_id"] == context.retained_trail
+    target = next(row for row in context.retained_again["entries"] if row["sha"] == context.overlap_target)
+    assert target["score"] == 0.5
+    with database(context) as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM trails WHERE id=?1", [context.overlap_old_trail]).fetchone()[0]
+            == 0
+        )

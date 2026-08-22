@@ -14,6 +14,13 @@ Eviction ordering for trail state and shared commit cohorts SHALL use source Git
 - **WHEN** an old shared commit fact is reused by a newly constructed trail
 - **THEN** its source age remains unchanged and does not become newer merely because another trail referenced it
 
+### Requirement: Recent commits are protected
+Trail state and shared commit facts newer than the wall-clock cutoff of `protect_recent_days` SHALL be ineligible for eviction. The setting SHALL default to 14 days and `0` SHALL disable protection.
+
+#### Scenario: Protected trail state exceeds capacity
+- **WHEN** protected trail state alone exceeds `max_entries`
+- **THEN** none is evicted and the cache temporarily exceeds the nominal capacity
+
 ### Requirement: Eviction preserves anchor correctness
 Eviction SHALL NOT mutate a retained immutable trail, remove shared facts it references, move a live ref alias without fresh Git resolution, or cause already materialized trail effects to apply twice.
 

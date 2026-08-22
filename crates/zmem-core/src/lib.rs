@@ -475,6 +475,7 @@ pub struct ActionJournal {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostResponse {
     pub protocol_version: u32,
     pub extension_hash: String,
@@ -808,6 +809,16 @@ impl GitRepo {
         Ok(status.success())
     }
 
+    pub fn ancestors(&self, commit: &str) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .git(&["rev-list", commit])?
+            .lines()
+            .skip(1)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
     pub fn walk(&self, after: Option<&str>, head: &str) -> anyhow::Result<Vec<String>> {
         let range = after.map_or_else(|| head.to_owned(), |anchor| format!("{anchor}..{head}"));
         let output = self.git(&["rev-list", "--reverse", "--topo-order", &range])?;
@@ -903,7 +914,8 @@ impl GitRepo {
             .output()?;
         anyhow::ensure!(
             output.status.success(),
-            "git command failed: {}",
+            "git {} failed: {}",
+            args.join(" "),
             String::from_utf8_lossy(&output.stderr)
         );
         Ok(String::from_utf8(output.stdout)?)

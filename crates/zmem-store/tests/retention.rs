@@ -90,6 +90,7 @@ fn unreferenced_trails_are_selected_by_source_time_before_shared_facts() {
             source_time: 20,
             referenced: false,
             protected: false,
+            entries: 1,
         },
         TrailCohort {
             repository_id: 1,
@@ -97,6 +98,7 @@ fn unreferenced_trails_are_selected_by_source_time_before_shared_facts() {
             source_time: 1,
             referenced: true,
             protected: false,
+            entries: 1,
         },
         TrailCohort {
             repository_id: 1,
@@ -104,6 +106,7 @@ fn unreferenced_trails_are_selected_by_source_time_before_shared_facts() {
             source_time: 10,
             referenced: false,
             protected: false,
+            entries: 1,
         },
     ];
     assert_eq!(select_trail_evictions(&trails), vec!["old", "new"]);

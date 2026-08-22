@@ -34,6 +34,10 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         include_invalid: bool,
+        #[arg(long = "ref")]
+        reference: Option<String>,
+        #[arg(long)]
+        observed_oid: Option<String>,
         #[arg(long, allow_hyphen_values = true)]
         commit_limit: Option<i64>,
         #[arg(long, allow_hyphen_values = true)]
@@ -81,6 +85,8 @@ struct ServiceRequest {
     message: Option<String>,
     #[serde(default)]
     reference: Option<String>,
+    #[serde(default)]
+    observed_oid: Option<String>,
     #[serde(default)]
     deep: bool,
     #[serde(default)]
@@ -137,6 +143,7 @@ fn ping(state: &ServiceState) -> bool {
             include_invalid: false,
             message: None,
             reference: None,
+            observed_oid: None,
             deep: false,
             commit_limit: None,
             node_limit: None,
@@ -233,6 +240,7 @@ struct RequestSpec {
     include_invalid: bool,
     message: Option<String>,
     reference: Option<String>,
+    observed_oid: Option<String>,
     deep: bool,
     commit_limit: Option<i64>,
     node_limit: Option<i64>,
@@ -250,6 +258,7 @@ fn request(spec: RequestSpec) -> anyhow::Result<serde_json::Value> {
             include_invalid: spec.include_invalid,
             message: spec.message,
             reference: spec.reference,
+            observed_oid: spec.observed_oid,
             deep: spec.deep,
             commit_limit: spec.commit_limit,
             node_limit: spec.node_limit,
@@ -331,9 +340,11 @@ fn serve() -> anyhow::Result<()> {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("repository path is required"))
                         .and_then(|path| {
-                            zmem_svc::sync_repository_with_attention(
+                            zmem_svc::sync_repository_with_ref_attention(
                                 path,
                                 (request.command == "add").then_some(request.trust_extensions),
+                                request.reference.as_deref(),
+                                request.observed_oid.as_deref(),
                                 request.commit_limit,
                                 request.node_limit,
                             )
@@ -433,6 +444,7 @@ fn main() -> anyhow::Result<()> {
                 include_invalid: false,
                 message: None,
                 reference: None,
+                observed_oid: None,
                 deep: false,
                 commit_limit,
                 node_limit,
@@ -441,6 +453,8 @@ fn main() -> anyhow::Result<()> {
         Command::Query {
             path,
             include_invalid,
+            reference,
+            observed_oid,
             commit_limit,
             node_limit,
         } => println!(
@@ -451,7 +465,8 @@ fn main() -> anyhow::Result<()> {
                 trust_extensions: false,
                 include_invalid,
                 message: None,
-                reference: None,
+                reference,
+                observed_oid,
                 deep: false,
                 commit_limit,
                 node_limit,
@@ -480,6 +495,7 @@ fn main() -> anyhow::Result<()> {
                     include_invalid: false,
                     message,
                     reference,
+                    observed_oid: None,
                     deep,
                     commit_limit,
                     node_limit,
@@ -502,6 +518,7 @@ fn main() -> anyhow::Result<()> {
                             include_invalid: false,
                             message: None,
                             reference: None,
+                            observed_oid: None,
                             deep: false,
                             commit_limit: None,
                             node_limit: None,

@@ -10,7 +10,7 @@ import venv
 from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
-ZMEM_ROOT = ROOT.parent / "zmem-2"
+ZMEM_ROOT = ROOT.parent / "zmem"
 
 
 def before_scenario(context, _scenario) -> None:
@@ -24,8 +24,10 @@ def before_scenario(context, _scenario) -> None:
     context.default_user.mkdir()
     context.env["USERPROFILE"] = str(context.default_user)
     context.env["HOME"] = str(context.default_user)
-    context.env["ZMEM_EXTENSION_HOST"] = str((ZMEM_ROOT / ".venv" / "Scripts" / "zmem-extension-host.exe").resolve())
-    context.svc = ROOT / "target" / "debug" / "zmem-svc.exe"
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    suffix = ".exe" if os.name == "nt" else ""
+    context.env["ZMEM_EXTENSION_HOST"] = str((ZMEM_ROOT / ".venv" / scripts / f"zmem-extension-host{suffix}").resolve())
+    context.svc = ROOT / "target" / "debug" / f"zmem-svc{suffix}"
     context.commit_count = 0
 
 
@@ -44,13 +46,14 @@ def assemble_test_runtime(context) -> None:
 
 
 def after_scenario(context, _scenario) -> None:
-    subprocess.run(
-        [context.svc, "stop"],
-        env=context.env,
-        capture_output=True,
-        timeout=5,
-        check=False,
-    )
+    if context.svc.is_file():
+        subprocess.run(
+            [context.svc, "stop"],
+            env=context.env,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
     shutil.rmtree(context.temp_root, ignore_errors=True)
 
 
