@@ -78,6 +78,20 @@ Unreferenced trails are eligible for eviction. Trail membership and sparse state
 
 If migration fails, the transaction leaves the previous database unchanged. After successful schema activation, rollback to an older binary is unsupported; recovery uses the retained database backup policy or reconstruction from Git with the compatible service.
 
+## Utility Plan (Disposable)
+
+Remove this section after these seams have fail-first unit proof and independent GREEN verification.
+
+- `derive_affected_areas(changes: &[ChangedPath]) -> Option<Vec<Area>>` normalizes root files and rename endpoints, groups non-root paths by top-level directory, reduces deepest common parents, and returns global for more than three areas.
+- `TrailIdentity::new(repository_id, head_oid, attention, extension_id, protocol, schema) -> TrailIdentity` creates a deterministic immutable identity from the complete compatibility tuple.
+- `resolve_selector(repository: &GitRepository, selector: &str, observed_oid: ObjectId) -> Result<ResolvedSelector, StaleRef>` resolves live without checkout and rejects an observed/native mismatch before trail selection.
+- `select_trail_commits(repository, head_oid, attention) -> Result<Vec<SelectedCommit>, SelectionError>` returns whole reachable commits in deterministic parent-before-child order with explicit completeness.
+- `validate_metadata_patch(action: MetadataPatchAction) -> Result<ValidatedMetadataPatch, MetadataDiagnostic>` validates declared keys, value types, operators, canonical-field exclusion, and ordered atomic operations.
+- `resolve_meta_range(membership, meta_commit, from, to) -> Result<Vec<ObjectId>, RangeDiagnostic>` selects the inclusive reachable ancestry range, including merged descendants, only when complete.
+- `resolve_metadata_assignments(assignments: &[ReachableAssignment]) -> EffectiveMetadata` applies descendant replacement and represents incomparable values as conflicts until a descendant assignment resolves them.
+- `migrate_v3_to_v4(transaction: &Transaction) -> Result<LegacyTrail, MigrationError>` preserves the materialized projection and existing state as one legacy trail with null affected areas and lazy-fact markers, without Git replay.
+- `evict_unreferenced_trails(transaction, policy) -> EvictionOutcome` removes eligible trail state before garbage-collecting source-time-ordered shared facts that no retained trail references.
+
 ## Open Questions
 
 None.
