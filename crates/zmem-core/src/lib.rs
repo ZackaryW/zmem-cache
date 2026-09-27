@@ -1,14 +1,261 @@
 //! Core zmem identities, wire records, and synchronization decisions.
 
 use serde::{Deserialize, Serialize};
+pub mod demand;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-pub const PROTOCOL_VERSION: u32 = 4;
-pub const SCHEMA_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn timed_out_child_is_killed_and_reaped_promptly() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("ping");
+            command.args(["-n", "10", "127.0.0.1"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("10");
+            command
+        };
+        let started = Instant::now();
+        let result = with_git_deadline(Some(started + Duration::from_millis(250)), || {
+            run_git_command_input(&mut command, Some(&vec![b'x'; 200_000]))
+        });
+        assert!(result.unwrap_err().to_string().contains("deadline expired"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancelled_child_is_killed_and_reaped_promptly() {
+        #[cfg(windows)]
+        let mut command = {
+            let mut command = Command::new("ping");
+            command.args(["-n", "10", "127.0.0.1"]);
+            command
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut command = Command::new("sleep");
+            command.arg("10");
+            command
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&cancelled);
+        let signaler = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            signal.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = with_git_cancellation(Some(cancelled), || {
+            run_git_command_input(&mut command, Some(&vec![b'x'; 200_000]))
+        });
+        signaler.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+}
+
+thread_local! {
+    static GIT_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+    static GIT_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+pub fn with_git_cancellation<T>(
+    cancelled: Option<Arc<AtomicBool>>,
+    action: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Arc<AtomicBool>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GIT_CANCELLATION.replace(self.0.take());
+        }
+    }
+    let previous = GIT_CANCELLATION.replace(cancelled);
+    let _restore = Restore(previous);
+    action()
+}
+
+pub fn with_git_deadline<T>(deadline: Option<Instant>, action: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Instant>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GIT_DEADLINE.set(self.0);
+        }
+    }
+    let previous = GIT_DEADLINE.replace(deadline);
+    let _restore = Restore(previous);
+    action()
+}
+
+fn run_git_command(command: &mut Command) -> anyhow::Result<Output> {
+    run_git_command_input(command, None)
+}
+
+fn run_git_command_input(command: &mut Command, input: Option<&[u8]>) -> anyhow::Result<Output> {
+    let deadline = GIT_DEADLINE.get();
+    if deadline.is_none()
+        && input.is_none()
+        && !GIT_CANCELLATION.with(|token| token.borrow().is_some())
+    {
+        return Ok(command.output()?);
+    }
+    supervise_process(
+        command,
+        input,
+        deadline,
+        GIT_CANCELLATION.with(|token| token.borrow().clone()),
+    )
+}
+
+/// Supervise the process and all three pipes under one budget. Input writes
+/// must not block the thread responsible for killing an abandoned process.
+pub fn supervise_process(
+    command: &mut Command,
+    input: Option<&[u8]>,
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<Output> {
+    let is_cancelled = || {
+        cancelled
+            .as_ref()
+            .is_some_and(|token| token.load(Ordering::Acquire))
+    };
+    anyhow::ensure!(!is_cancelled(), "service request cancelled");
+    if let Some(deadline) = deadline {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "service request deadline expired"
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child.stdout.take().expect("git stdout pipe");
+    let mut stderr = child.stderr.take().expect("git stderr pipe");
+    let out_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let input_writer = input.map(|input| {
+        let mut stdin = child.stdin.take().expect("child stdin pipe");
+        let owned = input.to_vec();
+        std::thread::spawn(move || stdin.write_all(&owned))
+    });
+    let mut status = None;
+    let completion = loop {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break Err(anyhow::anyhow!("service request deadline expired"));
+        }
+        if is_cancelled() {
+            break Err(anyhow::anyhow!("service request cancelled"));
+        }
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(found) => status = found,
+                Err(error) => break Err(error.into()),
+            }
+        }
+        if let Some(status) = status
+            && out_reader.is_finished()
+            && err_reader.is_finished()
+            && input_writer
+                .as_ref()
+                .is_none_or(std::thread::JoinHandle::is_finished)
+        {
+            break Ok(status);
+        }
+        std::thread::sleep(deadline.map_or(Duration::from_millis(5), |deadline| {
+            Duration::from_millis(5).min(deadline.saturating_duration_since(Instant::now()))
+        }));
+    };
+    if completion.is_err() {
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            // SAFETY: this child owns the process group created above.
+            unsafe {
+                kill(-(child.id() as i32), 9);
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(writer) = input_writer {
+            cancel_pipe_io(writer);
+        }
+        cancel_pipe_io(out_reader);
+        cancel_pipe_io(err_reader);
+        return completion.map(|_| unreachable!());
+    }
+    if let Some(writer) = input_writer {
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("child input writer panicked"))??;
+    }
+    let stdout = out_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stdout reader panicked"))??;
+    let stderr = err_reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("git stderr reader panicked"))??;
+    Ok(Output {
+        status: completion?,
+        stdout,
+        stderr,
+    })
+}
+
+fn cancel_pipe_io<T>(worker: std::thread::JoinHandle<T>) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CancelSynchronousIo(thread: *mut std::ffi::c_void) -> i32;
+        }
+        while !worker.is_finished() {
+            // SAFETY: the handle belongs to this live, owned I/O thread. Repeat
+            // to cover cancellation racing the thread's first pipe operation.
+            unsafe {
+                CancelSynchronousIo(worker.as_raw_handle());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let _ = worker.join();
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttentionLimit {
@@ -157,6 +404,33 @@ pub struct AttentionUsage {
 }
 
 impl AttentionUsage {
+    pub fn from_view_identity(identity: &str) -> Option<Self> {
+        let parts = identity.split(':').collect::<Vec<_>>();
+        if parts.len() != 8 || parts[0] != "v1" {
+            return None;
+        }
+        let reached = if parts[6].is_empty() {
+            Vec::new()
+        } else {
+            parts[6]
+                .split(',')
+                .map(|bound| match bound {
+                    "commit" => Some(AttentionBound::Commit),
+                    "node" => Some(AttentionBound::Node),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        Some(Self {
+            commit_limit: parts[1].parse().ok()?,
+            node_limit: parts[2].parse().ok()?,
+            selected_commits: parts[3].parse().ok()?,
+            selected_nodes: parts[4].parse().ok()?,
+            truncated: parts[5].parse().ok()?,
+            reached,
+        })
+    }
+
     pub fn view_identity(&self, lower_boundary: Option<&str>) -> String {
         let reached = self
             .reached
@@ -618,7 +892,7 @@ pub struct GitRepo {
     root: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GitCommit {
     pub sha: String,
     pub commit_time: i64,
@@ -724,24 +998,24 @@ pub struct ResolvedSelector {
     pub selector: String,
     pub oid: String,
     pub local_branch: bool,
+    pub route: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitWalk {
     pub shas: Vec<String>,
+    pub parents: std::collections::BTreeMap<String, Vec<String>>,
     pub truncated: bool,
 }
 
 impl GitRepo {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
-        let output = Command::new("git")
-            .args([
-                "-C",
-                &path.to_string_lossy(),
-                "rev-parse",
-                "--show-toplevel",
-            ])
-            .output()?;
+        let output = run_git_command(Command::new("git").args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--show-toplevel",
+        ]))?;
         anyhow::ensure!(
             output.status.success(),
             "not a Git repository: {}",
@@ -777,35 +1051,32 @@ impl GitRepo {
             oid == observed_oid,
             "stale ref: observed {observed_oid}, resolved {oid}"
         );
-        let local_branch = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{reference}"),
-            ])
-            .status()?
-            .success();
+        let named = self.git(&["rev-parse", "--symbolic-full-name", reference])?;
+        let name = named.trim();
+        let route = if name.starts_with("refs/") && !name.contains('\n') {
+            name.to_owned()
+        } else {
+            format!("oid:{oid}")
+        };
+        let local_branch = route.starts_with("refs/heads/");
         Ok(ResolvedSelector {
             selector: reference.to_owned(),
             oid,
             local_branch,
+            route,
         })
     }
 
     pub fn is_ancestor(&self, ancestor: &str, descendant: &str) -> anyhow::Result<bool> {
-        let status = Command::new("git")
-            .args([
-                "-C",
-                &self.root.to_string_lossy(),
-                "merge-base",
-                "--is-ancestor",
-                ancestor,
-                descendant,
-            ])
-            .status()?;
+        let status = run_git_command(Command::new("git").args([
+            "-C",
+            &self.root.to_string_lossy(),
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ]))?
+        .status;
         Ok(status.success())
     }
 
@@ -830,7 +1101,11 @@ impl GitRepo {
     }
 
     pub fn walk_newest(&self, head: &str, limit: AttentionLimit) -> anyhow::Result<GitWalk> {
-        let mut arguments = vec!["rev-list".to_owned(), "--topo-order".to_owned()];
+        let mut arguments = vec![
+            "rev-list".to_owned(),
+            "--topo-order".to_owned(),
+            "--parents".to_owned(),
+        ];
         let sentinel = limit.maximum().map(|maximum| maximum.saturating_add(1));
         if let Some(sentinel) = sentinel {
             arguments.push(format!("--max-count={sentinel}"));
@@ -838,16 +1113,31 @@ impl GitRepo {
         arguments.push(head.to_owned());
         let references = arguments.iter().map(String::as_str).collect::<Vec<_>>();
         let output = self.git(&references)?;
+        let mut parents = std::collections::BTreeMap::new();
         let mut shas = output
             .lines()
             .filter(|line| !line.is_empty())
-            .map(str::to_owned)
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let sha = fields
+                    .next()
+                    .expect("rev-list --parents emits an OID")
+                    .to_owned();
+                parents.insert(sha.clone(), fields.map(str::to_owned).collect());
+                sha
+            })
             .collect::<Vec<_>>();
         let truncated = limit.maximum().is_some_and(|maximum| shas.len() > maximum);
         if let Some(maximum) = limit.maximum() {
             shas.truncate(maximum);
         }
-        Ok(GitWalk { shas, truncated })
+        let selected = shas.iter().collect::<std::collections::BTreeSet<_>>();
+        parents.retain(|sha, _| selected.contains(sha));
+        Ok(GitWalk {
+            shas,
+            parents,
+            truncated,
+        })
     }
 
     pub fn walk_trail(&self, head: &str, limit: AttentionLimit) -> anyhow::Result<GitWalk> {
@@ -868,6 +1158,117 @@ impl GitRepo {
             message,
             changes: self.changed_paths(sha)?,
         })
+    }
+
+    /// Collect commit messages and changed paths with two Git processes per
+    /// batch, preserving caller order and the single-commit diff semantics.
+    pub fn commits_batch(&self, shas: &[String]) -> anyhow::Result<Vec<GitCommit>> {
+        if shas.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut show_args = vec!["show", "-s", "--format=%H%x00%ct%x00%B%x00"];
+        show_args.extend(shas.iter().map(String::as_str));
+        let show = self.git(&show_args)?;
+        let mut fields = show.split('\0');
+        let mut commits = Vec::with_capacity(shas.len());
+        for expected in shas {
+            let oid = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing batched commit OID"))?
+                .trim();
+            anyhow::ensure!(oid == expected, "batched commit order changed");
+            let commit_time = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing batched commit time"))?
+                .parse()?;
+            let message = fields
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("missing batched commit message"))?
+                .trim_end()
+                .to_owned();
+            commits.push(GitCommit {
+                sha: oid.to_owned(),
+                commit_time,
+                message,
+                changes: Vec::new(),
+            });
+        }
+        anyhow::ensure!(
+            fields.all(|field| field.trim().is_empty()),
+            "extra batched commit output"
+        );
+
+        let mut input = shas.join("\n").into_bytes();
+        input.push(b'\n');
+        let mut command = Command::new("git");
+        command.arg("-C").arg(&self.root).args([
+            "diff-tree",
+            "--stdin",
+            "--root",
+            "--name-status",
+            "-r",
+            "-M",
+            "-z",
+        ]);
+        let output = run_git_command_input(&mut command, Some(&input))?;
+        anyhow::ensure!(
+            output.status.success(),
+            "batched git diff-tree failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let changed = String::from_utf8(output.stdout)?;
+        let tokens = changed.split('\0').collect::<Vec<_>>();
+        let mut position = 0;
+        for (index, commit) in commits.iter_mut().enumerate() {
+            let next = tokens.get(position).copied().unwrap_or("");
+            if next != commit.sha {
+                // diff-tree omits merges and empty commits without changed paths.
+                anyhow::ensure!(
+                    next.is_empty() || shas[index + 1..].iter().any(|sha| sha == next),
+                    "batched diff header changed"
+                );
+                continue;
+            }
+            position += 1;
+            while let Some(status) = tokens.get(position).copied() {
+                if status.is_empty() || shas[index + 1..].iter().any(|next| status == next) {
+                    break;
+                }
+                position += 1;
+                if status.starts_with('R') || status.starts_with('C') {
+                    let old = *tokens
+                        .get(position)
+                        .ok_or_else(|| anyhow::anyhow!("missing rename source"))?;
+                    let new = *tokens
+                        .get(position + 1)
+                        .ok_or_else(|| anyhow::anyhow!("missing rename destination"))?;
+                    commit.changes.push(ChangedPath::rename(old, new));
+                    position += 2;
+                } else {
+                    anyhow::ensure!(
+                        matches!(
+                            status.chars().next(),
+                            Some('A' | 'M' | 'D' | 'T' | 'U' | 'X' | 'B')
+                        ),
+                        "invalid batched path status"
+                    );
+                    let path = *tokens
+                        .get(position)
+                        .ok_or_else(|| anyhow::anyhow!("missing changed path"))?;
+                    commit.changes.push(if status.starts_with('D') {
+                        ChangedPath::delete(path)
+                    } else {
+                        ChangedPath::path(path)
+                    });
+                    position += 1;
+                }
+            }
+        }
+        anyhow::ensure!(
+            tokens[position..].iter().all(|token| token.is_empty()),
+            "extra batched diff output"
+        );
+        Ok(commits)
     }
 
     pub fn changed_paths(&self, sha: &str) -> anyhow::Result<Vec<ChangedPath>> {
@@ -907,11 +1308,7 @@ impl GitRepo {
     }
 
     fn git(&self, args: &[&str]) -> anyhow::Result<String> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(args)
-            .output()?;
+        let output = run_git_command(Command::new("git").arg("-C").arg(&self.root).args(args))?;
         anyhow::ensure!(
             output.status.success(),
             "git {} failed: {}",

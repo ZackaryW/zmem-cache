@@ -19,6 +19,16 @@ Feature: Immutable native memory trails
     When both trails are queried including invalid entries
     Then the shared decision is invalid only on the cancellation trail
 
+  Scenario: A wider requested trail resolves cancellation across the prefetch boundary
+    Given a cancellation whose decision is older than a two-commit view
+    When the bounded trail publishes and an explicit wider demand caches older facts
+    Then the bounded trail leaves the decision outside its view and a wider trail cancels it
+
+  Scenario: META crossing a cached tier needs a complete requested range
+    Given an older decision cached before a META range crosses the two-commit boundary
+    When bounded and wider META trails are requested
+    Then the incomplete range publishes nothing and the wider trail assigns its owner
+
   Scenario: META fails during trail construction
     Given a candidate trail containing an incomplete META range
     When that trail is constructed
@@ -27,7 +37,7 @@ Feature: Immutable native memory trails
   Scenario: Upgrade a populated cache
     Given a populated schema-three cache with a materialized projection
     When the compatible service opens the database
-    Then a legacy trail preserves its query state without Git replay
+    Then the migrated legacy trail remains intact while a compatible trail is published
 
   Scenario: Query a detached commit
     Given memory reachable from a detached commit identity

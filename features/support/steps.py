@@ -3,9 +3,11 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -17,6 +19,7 @@ from features.support.lifecycle import (
     commit,
     database,
     init_repo,
+    query_until_ready,
     run_svc,
     write_config,
     write_global_extension,
@@ -27,7 +30,7 @@ def _query(context, include_invalid: bool = True) -> None:
     args = ["query", str(context.repo)]
     if include_invalid:
         args.append("--include-invalid")
-    run_svc(context, *args)
+    query_until_ready(context, *args)
 
 
 def _assert_success(context) -> None:
@@ -46,7 +49,10 @@ def _entry(context, sha: str) -> dict:
 
 def _persistent_state(context) -> str:
     with database(context) as connection:
-        return "\n".join(connection.iterdump())
+        return "\n".join(
+            line for line in connection.iterdump()
+            if not line.startswith(('INSERT INTO "raw_commit_facts"', 'INSERT INTO "prefetch_jobs"'))
+        )
 
 
 def _trail_rows(context) -> set[tuple[object, ...]]:
@@ -336,15 +342,88 @@ def given_advanced_repo(context):
 
 @when("a client queries the new HEAD")
 def when_query_advanced(context):
-    _query(context)
+    run_svc(context, "query", str(context.repo), "--include-invalid")
 
 
-@then("the service indexes through that HEAD before responding")
+@then("the service reports indexing and an explicit retry returns that HEAD")
 def then_query_is_fresh(context):
+    assert context.completed.returncode != 0
+    failure = json.loads(context.completed.stderr)
+    assert failure["code"] == "not_ready", (failure, context.completed.stdout)
+    assert failure["requested_oid"] == context.head
+    run_svc(context, "job-status", failure["job_id"])
+    _assert_success(context)
+    assert context.payload["state"] in {"queued", "running", "ready"}
+    query_until_ready(context, "query", str(context.repo), "--include-invalid")
     _assert_success(context)
     assert context.payload["summary"]["head"] == context.head
-    assert context.payload["summary"]["indexed_commits"] == 1
+    assert context.payload["summary"]["indexed_commits"] == 0
     assert {entry["content"] for entry in context.payload["entries"]} == {"first", "second"}
+
+
+@given("a cold repository with a slow first identity host")
+def given_slow_identity_cold_repo(context):
+    init_repo(context)
+    context.cold_head = commit(context, "zmem(DECISION): shared cold job")
+    marker = context.temp_root / "first-identity-started"
+    script = context.temp_root / "first-identity-host.py"
+    script.write_text(
+        "import json,os,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "data=sys.stdin.buffer.read()\n"
+        "request=json.loads(data)\n"
+        "marker=Path(os.environ['IDENTITY_MARKER'])\n"
+        "if request.get('operation') == 'identity' and not marker.exists():\n"
+        " marker.write_text('started')\n"
+        " time.sleep(2)\n"
+        "result=subprocess.run([os.environ['REAL_HOST']],input=data,capture_output=True)\n"
+        "sys.stdout.buffer.write(result.stdout)\n"
+        "sys.stderr.buffer.write(result.stderr)\n"
+        "sys.exit(result.returncode)\n"
+    )
+    context.env["REAL_HOST"] = context.env.pop("ZMEM_EXTENSION_HOST")
+    context.env["IDENTITY_MARKER"] = str(marker)
+    context.identity_marker = marker
+    write_config(context, extension_host=sys.executable, extension_host_args=[str(script)])
+
+
+@when("two clients query its exact HEAD during identity validation")
+def when_duplicate_cold_queries(context):
+    started = time.monotonic()
+    run_svc(context, "query", str(context.repo), "--timeout-ms", "5000")
+    context.first_cold_elapsed = time.monotonic() - started
+    assert context.completed.returncode != 0
+    context.first_cold_failure = json.loads(context.completed.stderr)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and not context.identity_marker.exists():
+        time.sleep(0.01)
+    assert context.identity_marker.exists()
+    started = time.monotonic()
+    run_svc(context, "query", str(context.repo), "--timeout-ms", "5000")
+    context.second_cold_elapsed = time.monotonic() - started
+    assert context.completed.returncode != 0
+    context.second_cold_failure = json.loads(context.completed.stderr)
+
+
+@then("both receive one indexing job before the identity host finishes")
+def then_cold_queries_coalesce_before_identity(context):
+    first = context.first_cold_failure
+    second = context.second_cold_failure
+    assert first["code"] == second["code"] == "not_ready", (first, second)
+    assert first["job_id"] == second["job_id"]
+    assert first["requested_oid"] == second["requested_oid"] == context.cold_head
+    assert context.first_cold_elapsed < 2
+    assert context.second_cold_elapsed < 2
+    query_until_ready(context, "query", str(context.repo), "--timeout-ms", "5000")
+    _assert_success(context)
+    assert context.payload["summary"]["head"] == context.cold_head
+    identity = context.payload["summary"]["trail"]["extension_identity"]
+    with database(context) as connection:
+        key = connection.execute(
+            "SELECT job_key FROM index_jobs WHERE id=?", (first["job_id"],)
+        ).fetchone()
+    assert key is not None
+    assert json.loads(key[0])["generation"] == f"{identity}:trusted=false", key
 
 
 @when("an authorized local client ensures and inspects the service")
@@ -361,7 +440,73 @@ def then_status_identity(context):
     assert context.payload["running"] is True
     assert context.payload["pid"] == context.ensure_payload["pid"]
     assert context.payload["release_version"]
-    assert context.payload["protocol_version"] == 4
+    assert context.payload["protocol_version"] == 5
+
+
+@when("a client leaves an incomplete request frame open")
+def when_incomplete_frame(context):
+    run_svc(context, "ensure")
+    _assert_success(context)
+    state = json.loads((context.home / "service.json").read_text())
+    context.incomplete_socket = socket.create_connection(("127.0.0.1", state["port"]), timeout=1)
+    context.incomplete_socket.sendall(b"{")
+
+
+@then("another client can inspect the running service promptly")
+def then_health_during_incomplete_frame(context):
+    try:
+        run_svc(context, "status")
+        _assert_success(context)
+        assert context.payload["running"] is True
+    finally:
+        context.incomplete_socket.close()
+
+
+@when("a client delays a short-budget request frame")
+def when_delayed_short_budget_frame(context):
+    run_svc(context, "ensure")
+    _assert_success(context)
+    state = json.loads((context.home / "service.json").read_text())
+    with socket.create_connection(("127.0.0.1", state["port"]), timeout=2) as stream:
+        stream.settimeout(2)
+        time.sleep(0.1)
+        request = {"token": state["token"], "command": "ping", "path": None, "timeout_ms": 25}
+        stream.sendall(json.dumps(request).encode() + b"\n")
+        stream.shutdown(socket.SHUT_WR)
+        frame = bytearray()
+        while b"\n" not in frame:
+            chunk = stream.recv(4096)
+            assert chunk, "service closed without a response"
+            frame.extend(chunk)
+        context.delayed_frame_response = json.loads(frame)
+
+
+@then("the service reports timeout instead of a late success")
+def then_delayed_frame_times_out(context):
+    assert context.delayed_frame_response["ok"] is False
+    assert context.delayed_frame_response["error"]["code"] == "timeout"
+
+
+@given("a fresh startup lock held in the isolated home")
+def given_fresh_startup_lock(context):
+    (context.home / "service-start.lock").write_text(
+        json.dumps({"owner": "test-holder", "created_at": int(time.time())})
+    )
+
+
+@when("an ensure request has a 100 millisecond budget")
+def when_short_ensure_waits(context):
+    started = time.monotonic()
+    run_svc(context, "ensure", "--timeout-ms", "100")
+    context.ensure_elapsed = time.monotonic() - started
+
+
+@then("startup returns a typed timeout within that budget")
+def then_startup_timeout_is_bounded(context):
+    assert context.completed.returncode != 0
+    assert json.loads(context.completed.stderr)["code"] == "timeout"
+    assert context.ensure_elapsed < 0.8, context.ensure_elapsed
+    assert not (context.home / "service.json").exists()
 
 
 @given("an alternate zmem home and a separate unused default home")
@@ -419,6 +564,41 @@ def then_concurrent_identity(context):
     assert context.payload["pid"] == payloads[0]["pid"], (context.payload, payloads)
 
 
+@given("a daemon whose ping is deliberately delayed")
+def given_delayed_ping_owner(context):
+    context.env["ZMEM_TEST_PING_DELAY_MS"] = "350"
+    run_svc(context, "ensure", "--timeout-ms", "5000")
+    _assert_success(context)
+    context.delayed_ping_owner = context.payload["pid"]
+
+
+@when("two short-budget ensure calls overlap that ping")
+def when_delayed_ping_concurrent_ensure(context):
+    def ensure():
+        return subprocess.run(
+            [context.svc, "ensure", "--timeout-ms", "100"],
+            env=context.env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        context.delayed_ping_ensures = list(pool.map(lambda _: ensure(), range(2)))
+
+
+@then("the original daemon remains the sole healthy owner")
+def then_delayed_ping_owner_stable(context):
+    errors = [json.loads(result.stderr) for result in context.delayed_ping_ensures]
+    assert all(result.returncode != 0 for result in context.delayed_ping_ensures), errors
+    assert all(error["code"] in {"busy", "timeout"} for error in errors), errors
+    run_svc(context, "status", "--timeout-ms", "2000")
+    _assert_success(context)
+    assert context.payload["running"] is True
+    assert context.payload["pid"] == context.delayed_ping_owner
+
+
 @given("a commit with a supported entry, unsupported annotation, and valid effect")
 def given_mixed_annotations(context):
     init_repo(context)
@@ -469,8 +649,10 @@ def when_two_descendants(context):
 @then("only those two commits are expanded before the anchor advances")
 def then_two_expanded(context):
     _assert_success(context)
-    assert context.payload["summary"]["indexed_commits"] == 2
+    assert context.payload["summary"]["indexed_commits"] == 0
     assert context.payload["summary"]["trail"]["resolved_oid"] == context.head
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM expansion_facts").fetchone()[0] == 3
 
 
 @given("an indexed history that cancels a decision")
@@ -498,7 +680,7 @@ def then_rebuilt_valid(context):
     _assert_success(context)
     decision = next(row for row in context.payload["entries"] if row["content"] == "keep")
     assert decision["valid"] is True and decision["score"] == 1.0
-    assert context.payload["summary"]["indexed_commits"] == 1
+    assert context.payload["summary"]["indexed_commits"] == 0
     assert context.payload["summary"]["trail"]["trail_id"] != context.cancelled_trail_id
 
 
@@ -704,7 +886,7 @@ def then_custom_persisted(context):
 @given("an extension host response containing data without valid journal provenance")
 def given_unjournaled_response(context):
     context.invalid_journal = json.dumps(
-        {"protocol_version": 4, "extension_hash": "x", "entries": [{"content": "bypass"}]}
+        {"protocol_version": 5, "extension_hash": "x", "entries": [{"content": "bypass"}]}
     )
 
 
@@ -778,7 +960,7 @@ def when_identity_changes(context):
 @then("repository synchronization selects a rebuild")
 def then_rebuild_selected(context):
     _assert_success(context)
-    assert context.payload["summary"]["indexed_commits"] == 1
+    assert context.payload["summary"]["indexed_commits"] == 0
     assert len(context.payload["entries"]) == 1 and context.payload["entries"][0]["content"] == "second"
 
 
@@ -830,7 +1012,7 @@ def count_attempt():
     return value + 1
 
 def response(**values):
-    print(json.dumps({{'protocol_version': 4, **values}}))
+    print(json.dumps({{'protocol_version': 5, **values}}))
 
 if MODE == 'timeout':
     STATE.write_text(str(os.getpid()))
@@ -916,13 +1098,22 @@ def given_timed_host(context):
 
 @when("the next repository range is indexed")
 def when_timed_range_indexed(context):
-    _query(context)
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--timeout-ms", "5000")
+    failure = json.loads(context.completed.stderr)
+    assert failure["code"] == "not_ready", failure
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        run_svc(context, "job-status", failure["job_id"])
+        _assert_success(context)
+        if context.payload["state"] == "failed":
+            return
+        time.sleep(0.05)
+    raise AssertionError("timed-out indexing job did not fail")
 
 
 @then("a host-timeout error is returned")
 def then_timeout_returned(context):
-    assert context.completed.returncode != 0
-    assert "timed out" in (context.completed.stdout + context.completed.stderr)
+    assert "timed out" in context.payload["error"], context.payload
 
 
 @then("the timed-out host exits without advancing the anchor")
@@ -1027,7 +1218,7 @@ def then_default_concurrency_bounded(context):
     _assert_success(context)
     with sqlite3.connect(context.host_state) as connection:
         maximum = connection.execute("SELECT maximum FROM state").fetchone()[0]
-    assert maximum == 8
+    assert 1 <= maximum <= 7  # one of eight permits is reserved for lookup identity
 
 
 @then("the service reports max_concurrency eight")
@@ -1087,7 +1278,7 @@ def when_current_parser_queries(context):
 def then_stale_inspections_replaced(context):
     _assert_success(context)
     with database(context) as connection:
-        current = connection.execute("SELECT COUNT(*) FROM inspections WHERE parser_protocol=4").fetchone()[0]
+        current = connection.execute("SELECT COUNT(*) FROM inspections WHERE parser_protocol=5").fetchone()[0]
     assert current >= len(context.stale_inspection_shas)
 
 
@@ -1135,7 +1326,7 @@ def given_native_node_boundary(context):
 
 @when("it is synchronized with unlimited commits and node limit 2")
 def when_native_two_node_attention(context):
-    run_svc(
+    query_until_ready(
         context,
         "query",
         str(context.repo),
@@ -1172,7 +1363,7 @@ def given_native_environment_one(context):
 
 @when("a query explicitly requests commit limit 3 and node limit 2")
 def when_native_explicit_limits(context):
-    run_svc(
+    query_until_ready(
         context,
         "query",
         str(context.repo),
@@ -1207,7 +1398,7 @@ def given_bounded_anchor_omits_decision(context):
     init_repo(context)
     context.decision_sha = commit(context, "zmem(DECISION): older bounded")
     commit(context, "zmem(LESSON_LEARNT): newest bounded")
-    run_svc(
+    query_until_ready(
         context,
         "query",
         str(context.repo),
@@ -1223,7 +1414,7 @@ def given_bounded_anchor_omits_decision(context):
 
 @when("the repository is queried with both attention limits unlimited")
 def when_query_unlimited_attention(context):
-    run_svc(
+    query_until_ready(
         context,
         "query",
         str(context.repo),
@@ -1342,7 +1533,7 @@ def _query_selector(context, selector: str, observed: str, *, node_limit: int | 
     ]
     if node_limit is not None:
         args.extend(("--node-limit", str(node_limit)))
-    run_svc(context, *args)
+    query_until_ready(context, *args)
     return context.payload
 
 
@@ -1443,6 +1634,95 @@ def then_cancel_is_trail_local(context):
     assert cancelled["valid"] is False and valid["valid"] is True
 
 
+@given("a cancellation whose decision is older than a two-commit view")
+def given_cross_tier_cancel(context):
+    write_config(context, background_commit_limit=4)
+    init_repo(context)
+    context.cross_tier_decision = commit(context, "zmem(DECISION): older target")
+    commit(context, "older filler")
+    commit(context, "recent filler")
+    context.cross_tier_head = commit(
+        context, f"zmem(CANCEL)[{context.cross_tier_decision[:10]}, 1]"
+    )
+
+
+@when("the bounded trail publishes and an explicit wider demand caches older facts")
+def when_cross_tier_cancel_prefetched(context):
+    query_until_ready(
+        context, "query", str(context.repo), "--include-invalid", "--commit-limit", "2"
+    )
+    _assert_success(context)
+    context.cross_tier_bounded = context.payload
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--commit-limit", "4")
+    _assert_success(context)
+
+
+@then("the bounded trail leaves the decision outside its view and a wider trail cancels it")
+def then_cross_tier_cancel_resolves_only_in_wider_trail(context):
+    assert context.cross_tier_bounded["entries"] == []
+    assert context.cross_tier_bounded["summary"]["attention"]["selected_commits"] == 2
+    query_until_ready(
+        context, "query", str(context.repo), "--include-invalid", "--commit-limit", "4"
+    )
+    _assert_success(context)
+    entries = context.payload["entries"]
+    assert len(entries) == 1 and entries[0]["sha"] == context.cross_tier_decision
+    assert entries[0]["valid"] is False
+    assert context.payload["summary"]["attention"]["selected_commits"] == 4
+
+
+@given("an older decision cached before a META range crosses the two-commit boundary")
+def given_cross_tier_meta(context):
+    write_config(context, background_commit_limit=4)
+    init_repo(context)
+    context.cross_tier_target = commit(context, "zmem(DECISION): older owner target")
+    commit(context, "old filler")
+    prior_head = commit(context, "recent filler")
+    query_until_ready(context, "query", str(context.repo), "--commit-limit", "2")
+    _assert_success(context)
+    query_until_ready(context, "query", str(context.repo), "--commit-limit", "3")
+    _assert_success(context)
+    context.cross_tier_meta_head = commit(
+        context,
+        f"zmem(META)[{context.cross_tier_target[:10]}, {prior_head[:10]}, owner=tier]",
+    )
+
+
+@when("bounded and wider META trails are requested")
+def when_cross_tier_meta_views(context):
+    run_svc(context, "query", str(context.repo), "--commit-limit", "2")
+    bounded = json.loads(context.completed.stderr)
+    assert bounded["code"] == "not_ready", bounded
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        run_svc(context, "job-status", bounded["job_id"])
+        _assert_success(context)
+        if context.payload["state"] == "failed":
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("incomplete META range job did not fail")
+    run_svc(context, "query", str(context.repo), "--commit-limit", "2")
+    context.cross_tier_meta_failure = json.loads(context.completed.stderr)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--commit-limit", "4")
+    _assert_success(context)
+    context.cross_tier_meta_wide = context.payload
+
+
+@then("the incomplete range publishes nothing and the wider trail assigns its owner")
+def then_cross_tier_meta_complete_only(context):
+    assert context.cross_tier_meta_failure["code"] == "service"
+    assert "complete" in context.cross_tier_meta_failure["message"].lower()
+    entries = context.cross_tier_meta_wide["entries"]
+    assert len(entries) == 1 and entries[0]["sha"] == context.cross_tier_target
+    assert entries[0]["owner"] == "tier"
+    with database(context) as connection:
+        trails = connection.execute(
+            "SELECT COUNT(*) FROM trails WHERE head_oid=?", [context.cross_tier_meta_head]
+        ).fetchone()[0]
+    assert trails == 1
+
+
 @given("a candidate trail containing an incomplete META range")
 def given_incomplete_meta_trail(context):
     init_repo(context)
@@ -1502,18 +1782,18 @@ def given_schema_three_projection(context):
 
 @when("the compatible service opens the database")
 def when_service_migrates_cache(context):
-    run_svc(context, "query", str(context.repo), "--include-invalid")
+    query_until_ready(context, "query", str(context.repo), "--include-invalid")
     _assert_success(context)
 
 
-@then("a legacy trail preserves its query state without Git replay")
+@then("the migrated legacy trail remains intact while a compatible trail is published")
 def then_legacy_trail_preserved(context):
     assert context.payload["summary"]["indexed_commits"] == 0
     assert context.payload["entries"][0]["content"] == "legacy"
-    assert context.payload["entries"][0]["affected_areas"] is None
     with database(context) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert connection.execute("SELECT legacy FROM trails").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM trails WHERE legacy=1").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM trails WHERE legacy=0").fetchone()[0] == 1
 
 
 @given("memory reachable from a detached commit identity")
@@ -1588,7 +1868,7 @@ def given_cross_area_rename(context):
 @when("its shared commit fact enters the cache")
 def when_index_renamed_fact(context):
     head = getattr(context, "rename_head", None) or context.broad_head
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", head)
     _assert_success(context)
 
 
@@ -1634,11 +1914,17 @@ def when_query_migrated_area(context):
     context.payload = json.loads(context.completed.stdout)
 
 
-@then("the entry reports null affected areas and remains visible")
+@then("the rebuilt entry is filtered while the legacy state remains intact")
 def then_migrated_entry_matches_area(context):
     _assert_success(context)
-    assert context.payload["count"] == 1
-    assert context.payload["results"][0]["affected_areas"] is None
+    assert context.payload["count"] == 0
+    with database(context) as connection:
+        legacy = connection.execute(
+            "SELECT cm.affected_areas FROM trails t JOIN trail_membership m ON m.trail_id=t.id "
+            "JOIN commit_metadata cm ON cm.repository_id=m.repository_id AND cm.commit_oid=m.commit_oid "
+            "WHERE t.legacy=1"
+        ).fetchone()
+    assert legacy is not None
 
 
 @given("a trail with metadata targets in a complete range")
@@ -1653,7 +1939,7 @@ def when_meta_appends_scalar(context):
         context,
         f"zmem(META)[{context.scalar_target[:10]}, {context.scalar_target[:10]}, owner+=team]",
     )
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.invalid_meta_head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.invalid_meta_head)
     _assert_success(context)
 
 
@@ -1691,7 +1977,7 @@ def given_merged_meta_range(context):
 
 @when("the selected trail applies the metadata patch")
 def when_apply_merged_range(context):
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.range_head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.range_head)
     _assert_success(context)
 
 
@@ -1721,7 +2007,7 @@ def given_concurrent_metadata(context):
     )
     _git(context, "merge", "--no-ff", "-m", "merge owners", "owner-b")
     context.conflict_merge = _git(context, "rev-parse", "HEAD")
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.conflict_merge)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.conflict_merge)
     _assert_success(context)
     target = next(row for row in context.payload["entries"] if row["sha"] == context.conflict_target)
     assert target["owner"] is None and target["metadata_conflicts"] == ["owner"]
@@ -1733,7 +2019,7 @@ def when_descendant_resolves_metadata(context):
         context,
         f"zmem(META)[{context.conflict_target[:10]}, {context.conflict_target[:10]}, owner=resolved]",
     )
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.resolved_head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.resolved_head)
     _assert_success(context)
 
 
@@ -1761,7 +2047,7 @@ def given_mixed_trail_annotations(context):
 
 @when("its immutable trail is indexed")
 def when_index_mixed_trail(context):
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.mixed_head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.mixed_head)
     _assert_success(context)
 
 
@@ -1796,7 +2082,7 @@ def when_query_advanced_trail(context):
 def then_advanced_trail_reuses_facts(context):
     trail = context.advance_result["summary"]["trail"]
     assert trail["trail_id"] != context.advance_old_trail
-    assert context.advance_result["summary"]["indexed_commits"] == 2
+    assert context.advance_result["summary"]["indexed_commits"] == 0
     with database(context) as connection:
         assert connection.execute("SELECT COUNT(*) FROM expansion_facts").fetchone()[0] == 3
 
@@ -1839,7 +2125,7 @@ def given_default_bounded_trail(context):
     init_repo(context)
     annotations = "\n".join(f"zmem(LESSON_LEARNT): node {index}" for index in range(401))
     context.large_head = commit(context, annotations)
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.large_head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.large_head)
     _assert_success(context)
     context.bounded_summary = context.payload["summary"]
     assert context.bounded_summary["attention"]["truncated"] is True
@@ -1847,7 +2133,7 @@ def given_default_bounded_trail(context):
 
 @when("the repository is queried with unlimited commit and node attention")
 def when_query_unlimited_trail(context):
-    run_svc(
+    query_until_ready(
         context,
         "query",
         str(context.repo),
@@ -1917,7 +2203,7 @@ def given_metadata_patch_journal(context):
 
 @when("the service constructs its selected trail")
 def when_construct_metadata_journal_trail(context):
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.journal_head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.journal_head)
     _assert_success(context)
 
 
@@ -1950,7 +2236,7 @@ def given_observed_advanced_head(context):
 
 @when("that exact observed commit is queried")
 def when_query_exact_observed_head(context):
-    run_svc(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.head)
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--observed-oid", context.head)
     _assert_success(context)
 
 
@@ -1979,6 +2265,381 @@ def when_query_unchecked_selector(context):
 def then_unchecked_selector_does_not_checkout(context):
     assert context.unchecked_result["summary"]["trail"]["resolved_oid"] == context.unchecked_oid
     assert _git(context, "status", "--porcelain=v1", "--branch") == context.worktree_before
+
+
+@given("eight commits with a requested three-commit view")
+def given_prefetch_view(context):
+    write_config(context, background_commit_limit=8)
+    init_repo(context)
+    for index in range(8):
+        commit(context, f"zmem(DECISION): tier {index}")
+
+
+@when("the requested view is indexed through an explicit retry")
+def when_requested_view_ready(context):
+    query_until_ready(context, "query", str(context.repo), "--include-invalid", "--commit-limit", "3")
+    _assert_success(context)
+
+
+@then("only the requested facts exist without speculative backfill")
+def then_shallow_no_prefetch(context):
+    assert context.payload["summary"]["attention"]["selected_commits"] == 3
+    for _ in range(3):
+        run_svc(context, "query", str(context.repo), "--commit-limit", "3")
+        _assert_success(context)
+    time.sleep(0.3)
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM raw_commit_facts").fetchone()[0] == 3
+        assert connection.execute("SELECT COUNT(*) FROM prefetch_jobs").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM expansion_facts").fetchone()[0] == 3
+
+
+@given("eight commits with background collection disabled")
+def given_zero_prefetch_ceiling(context):
+    given_prefetch_view(context)
+    write_config(context, background_commit_limit=0)
+
+
+@then("no background facts or checkpoint are stored")
+def then_zero_prefetch_ceiling(context):
+    time.sleep(0.2)
+    with database(context) as connection:
+        facts = connection.execute("SELECT COUNT(*) FROM raw_commit_facts").fetchone()[0]
+        jobs = connection.execute("SELECT COUNT(*) FROM prefetch_jobs").fetchone()[0]
+    assert facts == 3
+    assert jobs == 0
+    assert context.payload["summary"]["attention"]["selected_commits"] == 3
+
+
+@given("a repository whose extension expansion fails")
+def given_failing_index_job(context):
+    init_repo(context)
+    commit(context, "zmem(DECISION): will not publish")
+    marker = context.temp_root / "failed-once.marker"
+    write_global_extension(
+        context, "expanders", "broken.py",
+        "from pathlib import Path\nAPI_VERSION=1\n"
+        f"MARKER=Path({str(marker)!r})\n"
+        "def register(registry, mode='extend'):\n"
+        " if not MARKER.exists():\n  MARKER.write_text('failed')\n  raise RuntimeError('index job failed')\n",
+    )
+
+
+@when("its cold query admits an indexing job that fails")
+def when_cold_index_job_fails(context):
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--timeout-ms", "10000")
+    failure = json.loads(context.completed.stderr)
+    assert failure["code"] == "not_ready", (failure, context.completed.stdout)
+    context.failed_job_id = failure["job_id"]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        run_svc(context, "job-status", context.failed_job_id)
+        _assert_success(context)
+        if context.payload["state"] == "failed":
+            assert context.payload["error"], context.payload
+            assert context.payload["queue_depth"] == 0
+            assert isinstance(context.payload["queue_wait_ms"], int)
+            assert isinstance(context.payload["work_ms"], int)
+            return
+        time.sleep(0.05)
+    raise AssertionError("index job did not report failure")
+
+
+@then("restart preserves the failure until an explicit job retry succeeds")
+def then_failed_job_survives_restart(context):
+    run_svc(context, "stop")
+    run_svc(context, "ensure")
+    _assert_success(context)
+    run_svc(context, "job-status", context.failed_job_id)
+    _assert_success(context)
+    assert context.payload["state"] == "failed"
+    run_svc(context, "query", str(context.repo), "--include-invalid", "--timeout-ms", "10000")
+    failure = json.loads(context.completed.stderr)
+    assert failure["code"] == "service" and failure["job_id"] == context.failed_job_id
+    run_svc(context, "job-retry", context.failed_job_id)
+    _assert_success(context)
+    assert context.payload["state"] == "queued"
+    query_until_ready(context, "query", str(context.repo), "--include-invalid")
+    _assert_success(context)
+    assert context.payload["entries"][0]["content"] == "will not publish"
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 1
+
+
+@given("a published trail and a separate slow indexing host")
+def given_cached_and_slow_indexer(context):
+    init_repo(context)
+    context.cached_head = commit(context, "zmem(DECISION): cached")
+    context.heavy_repo = context.temp_root / "heavy-repo"
+    cached_repo = context.repo
+    context.repo = context.heavy_repo
+    init_repo(context)
+    commit(context, "zmem(DECISION): slow")
+    context.repo = cached_repo
+    context.heavy_marker = context.temp_root / "heavy-host-started"
+    script = context.temp_root / "slow-host.py"
+    script.write_text(
+        "import json,os,subprocess,sys,time\n"
+        "from pathlib import Path\n"
+        "data=sys.stdin.buffer.read()\n"
+        "request=json.loads(data)\n"
+        "if request.get('operation') in ('identity','expand') and 'heavy-repo' in request['repo']:\n"
+        " Path(os.environ['HEAVY_MARKER']).write_text(str(os.getpid()))\n"
+        " time.sleep(2)\n"
+        "result=subprocess.run([os.environ['REAL_HOST']],input=data,capture_output=True)\n"
+        "sys.stdout.buffer.write(result.stdout)\n"
+        "sys.stderr.buffer.write(result.stderr)\n"
+        "sys.exit(result.returncode)\n"
+    )
+    context.env["REAL_HOST"] = context.env.pop("ZMEM_EXTENSION_HOST")
+    context.env["HEAVY_MARKER"] = str(context.heavy_marker)
+    write_config(context, max_concurrency=2, extension_host=sys.executable, extension_host_args=[str(script)])
+    query_until_ready(context, "query", str(context.repo), "--timeout-ms", "10000")
+    _assert_success(context)
+    assert context.payload["summary"]["trail"]["resolved_oid"] == context.cached_head
+
+
+@when("the slow indexer occupies heavy host capacity")
+def when_slow_indexer_runs(context):
+    context.heavy_process = subprocess.Popen(
+        [context.svc, "add", str(context.heavy_repo), "--timeout-ms", "10000"],
+        env=context.env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not context.heavy_marker.exists():
+        if context.heavy_process.poll() is not None:
+            stdout, stderr = context.heavy_process.communicate()
+            raise AssertionError(f"heavy indexer exited early: {stdout} {stderr}")
+        time.sleep(0.01)
+    assert context.heavy_marker.exists(), "heavy host did not start"
+
+
+@then("the exact cached lookup and health request finish before that indexer")
+def then_cached_lookup_is_reserved(context):
+    started = time.monotonic()
+    run_svc(context, "query", str(context.repo), "--timeout-ms", "1000")
+    _assert_success(context)
+    assert context.payload["summary"]["trail"]["resolved_oid"] == context.cached_head
+    run_svc(context, "status")
+    _assert_success(context)
+    assert context.payload["running"] is True
+    assert time.monotonic() - started < 1.5
+    assert context.heavy_process.poll() is None
+    stdout, stderr = context.heavy_process.communicate(timeout=10)
+    assert context.heavy_process.returncode == 0, (stdout, stderr)
+
+
+@when("add and fast check wait for the same cold history")
+def when_add_and_fast_check_share_history(context):
+    run_svc(context, "query", str(context.heavy_repo), "--node-limit", "399", "--timeout-ms", "10000")
+    failure = json.loads(context.completed.stderr)
+    assert failure["code"] == "not_ready", failure
+    context.shared_job_id = failure["job_id"]
+    context.shared_add = subprocess.Popen(
+        [context.svc, "add", str(context.heavy_repo), "--node-limit", "399", "--timeout-ms", "15000"],
+        env=context.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    context.shared_check = subprocess.Popen(
+        [context.svc, "check", str(context.heavy_repo), "--timeout-ms", "15000"],
+        env=context.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    assert context.shared_check.stdin is not None
+    context.shared_check.stdin.write("zmem(DECISION): proposed preview")
+    context.shared_check.stdin.close()
+    context.shared_check.stdin = None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not context.heavy_marker.exists():
+        time.sleep(0.01)
+    assert context.heavy_marker.exists(), "shared indexing host did not start"
+
+
+@then("both complete while cached lookup remains available")
+def then_add_and_fast_check_share_history(context):
+    started = time.monotonic()
+    run_svc(context, "query", str(context.repo), "--timeout-ms", "1000")
+    _assert_success(context)
+    assert context.payload["summary"]["trail"]["resolved_oid"] == context.cached_head
+    assert time.monotonic() - started < 1.5
+    add_stdout, add_stderr = context.shared_add.communicate(timeout=20)
+    check_stdout, check_stderr = context.shared_check.communicate(timeout=20)
+    assert context.shared_add.returncode == 0, (add_stdout, add_stderr)
+    assert context.shared_check.returncode == 0, (check_stdout, check_stderr)
+    assert json.loads(add_stdout)["indexed_commits"] == 1
+    assert json.loads(check_stdout)["ok"] is True
+    run_svc(context, "job-status", context.shared_job_id)
+    _assert_success(context)
+    assert context.payload["state"] == "ready"
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM index_jobs WHERE id=?", (context.shared_job_id,)).fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM commits WHERE oid=?", ("0" * 40,)).fetchone()[0] == 0
+
+
+@when("a deep-check client disconnects after its host starts")
+def when_deep_check_disconnects(context):
+    state = json.loads((context.home / "service.json").read_text())
+    stream = socket.create_connection(("127.0.0.1", state["port"]), timeout=2)
+    request = {
+        "token": state["token"], "command": "check", "path": str(context.heavy_repo),
+        "message": "zmem(DECISION): abandoned proposal", "deep": True,
+        "commit_limit": 1, "timeout_ms": 10000,
+    }
+    stream.sendall(json.dumps(request).encode() + b"\n")
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline and not context.heavy_marker.exists():
+            time.sleep(0.01)
+        assert context.heavy_marker.exists(), "deep-check host did not start"
+        context.abandoned_host_pid = int(context.heavy_marker.read_text())
+        context.disconnect_at = time.monotonic()
+    finally:
+        stream.close()
+
+
+@when("a cached-lookup client disconnects during identity validation")
+def when_lookup_disconnects(context):
+    _disconnect_during_identity(context, "query")
+
+
+@when("an add client disconnects during admission identity validation")
+def when_add_admission_disconnects(context):
+    _disconnect_during_identity(context, "add")
+
+
+def _disconnect_during_identity(context, command):
+    query_until_ready(context, "query", str(context.heavy_repo), "--timeout-ms", "10000")
+    _assert_success(context)
+    context.heavy_marker.unlink(missing_ok=True)
+    state = json.loads((context.home / "service.json").read_text())
+    stream = socket.create_connection(("127.0.0.1", state["port"]), timeout=2)
+    request = {
+        "token": state["token"], "command": command, "path": str(context.heavy_repo),
+        "timeout_ms": 10000,
+    }
+    stream.sendall(json.dumps(request).encode() + b"\n")
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline and not context.heavy_marker.exists():
+            time.sleep(0.01)
+        assert context.heavy_marker.exists(), "lookup identity host did not start"
+        context.abandoned_host_pid = int(context.heavy_marker.read_text())
+        context.disconnect_at = time.monotonic()
+    finally:
+        stream.close()
+
+
+@then("the abandoned host exits and another client queries the same daemon")
+def then_abandoned_check_releases_resources(context):
+    deadline = context.disconnect_at + 1
+    while time.monotonic() < deadline and _process_exists(context.abandoned_host_pid):
+        time.sleep(0.01)
+    assert not _process_exists(context.abandoned_host_pid), "request-owned host survived disconnect"
+    cleanup_ms = round((time.monotonic() - context.disconnect_at) * 1000, 1)
+    print(f"disconnect_cleanup_ms={cleanup_ms}")
+    run_svc(context, "query", str(context.repo), "--timeout-ms", "1000")
+    _assert_success(context)
+    assert context.payload["summary"]["trail"]["resolved_oid"] == context.cached_head
+    run_svc(context, "status")
+    _assert_success(context)
+    assert context.payload["running"] is True
+
+
+@given("a cold repository with one historical decision")
+def given_cold_check_budget(context):
+    init_repo(context)
+    commit(context, "zmem(DECISION): unneeded historical expansion")
+
+
+@when("a proposed decision consumes the entire fast-check node budget")
+def when_zero_history_budget(context):
+    run_svc(context, "check", str(context.repo), "--node-limit", "1", input_text="zmem(DECISION): proposed")
+    _assert_success(context)
+
+
+@then("no historical expansion or wider trail is published")
+def then_no_history_expansion(context):
+    assert context.payload["ok"] is True
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM expansion_facts").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM trails WHERE selected_node_count > 0").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM index_jobs").fetchone()[0] == 0
+
+
+@when("a large deep check times out writing to an unread host pipe")
+def when_blocked_host_stdin_times_out(context):
+    script = context.temp_root / "slow-host.py"
+    script.write_text(
+        "import os,time\nfrom pathlib import Path\n"
+        "Path(os.environ['HEAVY_MARKER']).write_text(str(os.getpid()))\n"
+        "time.sleep(10)\n"
+    )
+    run_svc(context, "check", str(context.heavy_repo), "--deep", "--timeout-ms", "500",
+            input_text="zmem(DECISION): " + "x" * 200_000)
+    assert context.completed.returncode != 0
+    assert json.loads(context.completed.stderr)["code"] == "timeout"
+    assert context.heavy_marker.exists()
+    context.timed_host_pid = int(context.heavy_marker.read_text())
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline and _process_exists(context.timed_host_pid):
+        time.sleep(0.01)
+    assert not _process_exists(context.timed_host_pid)
+    # Restore a functioning host for the follow-up lookup through the same daemon.
+    script.write_text(
+        "import os,subprocess,sys\n"
+        "result=subprocess.run([os.environ['REAL_HOST']],input=sys.stdin.buffer.read(),capture_output=True)\n"
+        "sys.stdout.buffer.write(result.stdout)\n"
+        "sys.exit(result.returncode)\n"
+    )
+
+
+@when("a deep check exceeds its request deadline")
+def when_deep_check_times_out(context):
+    run_svc(
+        context, "check", str(context.heavy_repo), "--deep", "--commit-limit", "1",
+        "--timeout-ms", "1500", input_text="zmem(DECISION): timed proposal\n",
+    )
+    assert context.completed.returncode != 0
+    assert json.loads(context.completed.stderr)["code"] == "timeout"
+    assert context.heavy_marker.exists(), "deep-check host did not start"
+    context.timed_host_pid = int(context.heavy_marker.read_text())
+
+
+@then("the timed-out host exits and another client queries the same daemon")
+def then_timed_check_releases_resources(context):
+    assert not _process_exists(context.timed_host_pid), "timed-out host survived"
+    run_svc(context, "query", str(context.repo), "--timeout-ms", "1000")
+    _assert_success(context)
+    assert context.payload["summary"]["trail"]["resolved_oid"] == context.cached_head
+    run_svc(context, "status")
+    _assert_success(context)
+    assert context.payload["running"] is True
+
+
+@when("the service stops while that host is running")
+def when_service_stops_during_host(context):
+    context.old_service_pid = json.loads((context.home / "service.json").read_text())["pid"]
+    context.stopping_host_pid = int(context.heavy_marker.read_text())
+    started = time.monotonic()
+    run_svc(context, "stop", "--timeout-ms", "5000")
+    _assert_success(context)
+    assert time.monotonic() - started < 5
+
+
+@then("its host exits and a new daemon acquires ownership")
+def then_shutdown_releases_owner(context):
+    assert not _process_exists(context.stopping_host_pid)
+    context.heavy_process.communicate(timeout=5)
+    assert context.heavy_process.returncode != 0
+    run_svc(context, "status")
+    _assert_success(context)
+    assert context.payload["running"] is False
+    run_svc(context, "ensure", "--timeout-ms", "5000")
+    _assert_success(context)
+    assert context.payload["pid"] != context.old_service_pid
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM trails").fetchone()[0] == 1
 
 
 @given("capacity is exceeded by old unreferenced trail state sharing commit facts")
@@ -2116,3 +2777,106 @@ def then_retained_effect_not_duplicated(context):
             connection.execute("SELECT COUNT(*) FROM trails WHERE id=?1", [context.overlap_old_trail]).fetchone()[0]
             == 0
         )
+
+
+@given("1600 commits and persisted qualified demand for a 1000-commit route")
+def given_qualified_deeper_demand(context):
+    from benchmarks.tiered_history import make_history
+    context.adaptive_head = make_history(context.repo, 1600, 50)
+    write_config(context, background_commit_limit=10000)
+    query_until_ready(context, "query", str(context.repo), "--commit-limit", "1000", "--timeout-ms", "30000")
+    _assert_success(context)
+    context.adaptive_summary = context.payload["summary"]
+    run_svc(context, "stop")
+    _assert_success(context)
+    now = int(time.time())
+    context.adaptive_route = {
+        "repository": context.adaptive_summary["repository"], "route": "refs/heads/main",
+        "oid": context.adaptive_head,
+        "generation": context.adaptive_summary["trail"]["extension_identity"],
+        "observations": [{"at": now-120,"depth": 1000},{"at": now-60,"depth": 1000}],
+    }
+    _seed_adaptive_route(context)
+
+
+def _seed_adaptive_route(context):
+    payload = json.dumps(context.adaptive_route)
+    with database(context) as connection:
+        connection.execute("INSERT OR REPLACE INTO route_demand VALUES(?,?,?,?)",
+                           (context.adaptive_route["repository"],context.adaptive_route["route"],payload,len(payload)))
+
+
+@when("the daemon resumes eligible demand")
+def when_resume_eligible_demand(context):
+    run_svc(context, "ensure")
+    _assert_success(context)
+
+
+@then("prefetch stops at 1500 and an explicit wider query reuses 500 speculative facts")
+def then_adaptive_lead_and_reuse(context):
+    deadline = time.monotonic()+15
+    while time.monotonic() < deadline:
+        with database(context) as connection:
+            checkpoint = connection.execute("SELECT completed_count,state FROM prefetch_jobs WHERE head_oid=?",(context.adaptive_head,)).fetchone()
+        if checkpoint == (1500,"ready"):
+            break
+        time.sleep(0.05)
+    assert checkpoint == (1500,"ready"), checkpoint
+    for _ in range(3):
+        run_svc(context,"query",str(context.repo),"--commit-limit","1000")
+        _assert_success(context)
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM raw_commit_facts").fetchone()[0] == 1500
+        assert connection.execute("SELECT produced_facts,reused_facts FROM prefetch_metrics").fetchone() == (500,0)
+    query_until_ready(context,"query",str(context.repo),"--commit-limit","1500","--timeout-ms","30000")
+    _assert_success(context)
+    with database(context) as connection:
+        assert connection.execute("SELECT reused_facts FROM prefetch_metrics").fetchone()[0] == 500
+    assert context.payload["summary"]["trail"]["selected_commits"] == 1500
+
+
+@when("those observations expire before restart")
+def when_expire_demand(context):
+    for observation in context.adaptive_route["observations"]:
+        observation["at"] -= 7200
+    _seed_adaptive_route(context)
+    with database(context) as connection:
+        connection.execute("INSERT INTO prefetch_jobs(repository_id,head_oid,ceiling,completed_count,state) SELECT id,?,10000,0,'paused_shutdown' FROM repositories",(context.adaptive_head,))
+    run_svc(context,"ensure")
+    _assert_success(context)
+
+
+@then("the daemon leaves older history uncollected")
+def then_expired_demand_stays_idle(context):
+    time.sleep(0.5)
+    with database(context) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM raw_commit_facts").fetchone()[0] == 1000
+        assert connection.execute("SELECT produced_facts FROM prefetch_metrics").fetchone()[0] == 0
+
+
+@when("the canonical writer is blocked while cached lookups complete")
+def when_saturated_advisory_writer(context):
+    connection = database(context)
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        time.sleep(5.2)
+        for _ in range(4):
+            started=time.monotonic()
+            run_svc(context,"query",str(context.repo),"--timeout-ms","1000")
+            _assert_success(context)
+            assert time.monotonic()-started < 1.2
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+@then("the lookups succeed and advisory observations persist after the lock clears")
+def then_advisory_flush_recovers(context):
+    deadline=time.monotonic()+7
+    while time.monotonic()<deadline:
+        with database(context) as connection:
+            count=connection.execute("SELECT COUNT(*) FROM route_demand").fetchone()[0]
+        if count:
+            return
+        time.sleep(0.05)
+    assert count>0

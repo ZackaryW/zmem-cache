@@ -14,10 +14,10 @@ Feature: Layered commit metadata
     When its shared commit fact enters the cache
     Then its affected areas are null and globally applicable
 
-  Scenario: Filter a migrated entry
+  Scenario: Filter a rebuilt entry after migration
     Given a migrated legacy entry without an affected-area override
     When the trail is queried with any affected-area filter
-    Then the entry reports null affected areas and remains visible
+    Then the rebuilt entry is filtered while the legacy state remains intact
 
   Scenario: Invalid scalar append
     Given a trail with metadata targets in a complete range

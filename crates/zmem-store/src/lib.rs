@@ -1,12 +1,18 @@
 //! SQLite storage and retention decisions.
 
 use anyhow::Context;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+mod demand;
+pub use demand::{AdvisoryBatch, DemandUse, PrefetchMetrics};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use zmem_core::{
     Action, Anchor, GitCommit, HostResponse, MetadataOperation, MetadataOperator, SCHEMA_VERSION,
-    derive_affected_areas,
+    TrailIdentity, derive_affected_areas,
 };
 
 const LEGACY_SCHEMA: &str = "
@@ -41,6 +47,7 @@ CREATE TABLE IF NOT EXISTS trail_membership(
     PRIMARY KEY(trail_id,commit_oid),
     FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE
 );
+CREATE INDEX IF NOT EXISTS trail_membership_by_commit ON trail_membership(repository_id,commit_oid);
 CREATE TABLE IF NOT EXISTS commit_metadata(
     repository_id INTEGER NOT NULL,
     commit_oid TEXT NOT NULL,
@@ -58,6 +65,43 @@ CREATE TABLE IF NOT EXISTS commit_ancestry(
     ancestor_oid TEXT NOT NULL,
     PRIMARY KEY(repository_id,commit_oid,ancestor_oid),
     FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS commit_parents(
+    repository_id INTEGER NOT NULL,
+    commit_oid TEXT NOT NULL,
+    parent_oid TEXT NOT NULL,
+    PRIMARY KEY(repository_id,commit_oid,parent_oid),
+    FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS commit_parents_reverse ON commit_parents(repository_id,parent_oid);
+CREATE TABLE IF NOT EXISTS raw_commit_facts(
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    commit_oid TEXT NOT NULL,
+    fact TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    PRIMARY KEY(repository_id,commit_oid)
+);
+CREATE TABLE IF NOT EXISTS raw_parent_edges(
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    commit_oid TEXT NOT NULL,
+    parent_oid TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    PRIMARY KEY(repository_id,commit_oid,parent_oid)
+);
+CREATE TABLE IF NOT EXISTS prefetch_jobs(
+    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+    head_oid TEXT NOT NULL,
+    ceiling INTEGER NOT NULL,
+    completed_count INTEGER NOT NULL DEFAULT 0,
+    checkpoint_oid TEXT,
+    state TEXT NOT NULL,
+    PRIMARY KEY(repository_id,head_oid)
+);
+CREATE TABLE IF NOT EXISTS index_jobs(
+    id TEXT PRIMARY KEY,
+    job_key TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL,
+    failure TEXT
 );
 CREATE TABLE IF NOT EXISTS metadata_assignments(
     repository_id INTEGER NOT NULL,
@@ -190,6 +234,7 @@ pub fn select_evictions(rows: &[Cohort], now: i64, policy: RetentionPolicy) -> E
 
 pub struct Store {
     connection: Connection,
+    staging_protection: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -207,6 +252,21 @@ pub struct TrailRecord {
     pub source_time: i64,
 }
 
+pub struct PublishedSnapshot {
+    pub trail: TrailRecord,
+    pub entries: Vec<serde_json::Value>,
+    pub relationships: Vec<serde_json::Value>,
+    pub diagnostics: Vec<serde_json::Value>,
+    pub over_capacity: bool,
+}
+
+pub struct PersistedIndexJob {
+    pub id: String,
+    pub job_key: String,
+    pub state: String,
+    pub failure: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectionRecord {
     pub oid: String,
@@ -221,14 +281,19 @@ pub struct CommitUpdate<'a> {
     pub response: &'a HostResponse,
     pub anchor: &'a Anchor,
     pub affected_areas: Option<&'a [String]>,
-    pub ancestors: &'a [String],
+    pub parents: &'a [String],
     pub range_complete: bool,
+}
+
+pub struct RawCommitBatch<'a> {
+    pub facts: &'a [GitCommit],
+    pub parents: &'a std::collections::BTreeMap<String, Vec<String>>,
 }
 
 pub struct TrailPublication<'a> {
     pub trail: &'a TrailRecord,
     pub commits: &'a [GitCommit],
-    pub ancestors: &'a std::collections::BTreeMap<String, Vec<String>>,
+    pub parents: &'a std::collections::BTreeMap<String, Vec<String>>,
     pub entries: &'a [serde_json::Value],
     pub relationships: &'a [serde_json::Value],
     pub diagnostics: &'a [serde_json::Value],
@@ -345,8 +410,15 @@ fn resolve_commit_prefix(
     Ok(matches[0].clone())
 }
 
+#[derive(Default)]
+struct ReachabilityCache {
+    ancestors: HashMap<(String, String), bool>,
+    ranges: HashMap<(String, String), Vec<String>>,
+}
+
 fn metadata_targets(
     tx: &Transaction<'_>,
+    cache: &mut ReachabilityCache,
     repo_id: i64,
     current_oid: &str,
     from_prefix: &str,
@@ -356,38 +428,63 @@ fn metadata_targets(
     anyhow::ensure!(complete, "incomplete META range");
     let from = resolve_commit_prefix(tx, repo_id, from_prefix)?;
     let to = resolve_commit_prefix(tx, repo_id, to_prefix)?;
-    let is_ancestor = |descendant: &str, ancestor: &str| -> anyhow::Result<bool> {
-        Ok(descendant == ancestor
-            || tx
-                .query_row(
-                    "SELECT 1 FROM commit_ancestry WHERE repository_id=?1 AND commit_oid=?2 AND ancestor_oid=?3",
-                    params![repo_id, descendant, ancestor],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some())
-    };
     anyhow::ensure!(
-        is_ancestor(&to, &from)?,
+        is_ancestor(tx, cache, repo_id, &to, &from)?,
         "META from is not an ancestor of to"
     );
     anyhow::ensure!(
         current_oid != from
             && current_oid != to
-            && is_ancestor(current_oid, &from)?
-            && is_ancestor(current_oid, &to)?,
+            && is_ancestor(tx, cache, repo_id, current_oid, &from)?
+            && is_ancestor(tx, cache, repo_id, current_oid, &to)?,
         "META endpoints must precede META commit"
     );
+    if let Some(targets) = cache.ranges.get(&(from.clone(), to.clone())) {
+        return Ok(targets.clone());
+    }
     let mut statement = tx.prepare(
-        "SELECT c.oid FROM commits c
+        "WITH RECURSIVE from_desc(oid) AS (
+             SELECT ?2 UNION SELECT p.commit_oid FROM commit_parents p JOIN from_desc f ON p.parent_oid=f.oid WHERE p.repository_id=?1
+         ), to_anc(oid) AS (
+             SELECT ?3 UNION SELECT p.parent_oid FROM commit_parents p JOIN to_anc t ON p.commit_oid=t.oid WHERE p.repository_id=?1
+         )
+         SELECT c.oid FROM commits c
          WHERE c.repository_id=?1
-           AND (c.oid=?2 OR EXISTS(SELECT 1 FROM commit_ancestry a WHERE a.repository_id=?1 AND a.commit_oid=c.oid AND a.ancestor_oid=?2))
-           AND (c.oid=?3 OR EXISTS(SELECT 1 FROM commit_ancestry a WHERE a.repository_id=?1 AND a.commit_oid=?3 AND a.ancestor_oid=c.oid))
+           AND c.oid IN from_desc
+           AND c.oid IN to_anc
          ORDER BY c.rowid",
     )?;
-    Ok(statement
+    let targets = statement
         .query_map(params![repo_id, from, to], |row| row.get(0))?
-        .collect::<Result<_, _>>()?)
+        .collect::<Result<Vec<_>, _>>()?;
+    cache.ranges.insert((from, to), targets.clone());
+    Ok(targets)
+}
+
+fn is_ancestor(
+    tx: &Transaction<'_>,
+    cache: &mut ReachabilityCache,
+    repo_id: i64,
+    descendant: &str,
+    ancestor: &str,
+) -> anyhow::Result<bool> {
+    if descendant == ancestor {
+        return Ok(true);
+    }
+    let key = (descendant.to_owned(), ancestor.to_owned());
+    if let Some(found) = cache.ancestors.get(&key) {
+        return Ok(*found);
+    }
+    let found = tx.query_row(
+        "WITH RECURSIVE reach(oid) AS (
+             SELECT ?2 UNION SELECT p.parent_oid FROM commit_parents p JOIN reach r ON p.commit_oid=r.oid WHERE p.repository_id=?1
+         )
+         SELECT EXISTS(SELECT 1 FROM reach WHERE oid=?3)",
+        params![repo_id, descendant, ancestor],
+        |row| row.get(0),
+    )?;
+    cache.ancestors.insert(key, found);
+    Ok(found)
 }
 
 fn update_conflict_key(
@@ -417,6 +514,7 @@ fn update_conflict_key(
 
 fn assign_metadata_value(
     tx: &Transaction<'_>,
+    cache: &mut ReachabilityCache,
     repo_id: i64,
     target_oid: &str,
     source_oid: &str,
@@ -430,17 +528,13 @@ fn assign_metadata_value(
             row.get::<_, String>(0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let descends_from_all = previous.iter().all(|source| {
-        tx.query_row(
-            "SELECT 1 FROM commit_ancestry WHERE repository_id=?1 AND commit_oid=?2 AND ancestor_oid=?3",
-            params![repo_id, source_oid, source],
-            |_| Ok(()),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .is_some()
-    });
+    let mut descends_from_all = true;
+    for source in &previous {
+        if !is_ancestor(tx, cache, repo_id, source_oid, source)? {
+            descends_from_all = false;
+            break;
+        }
+    }
     if descends_from_all {
         tx.execute(
             "DELETE FROM metadata_assignments WHERE repository_id=?1 AND target_oid=?2 AND metadata_key=?3",
@@ -533,6 +627,7 @@ fn add_metadata_value(
 
 fn evaluate_update(
     tx: &Transaction<'_>,
+    cache: &mut ReachabilityCache,
     repo_id: i64,
     update: &CommitUpdate<'_>,
     advance_anchor: bool,
@@ -550,10 +645,10 @@ fn evaluate_update(
         "INSERT OR IGNORE INTO commit_metadata(repository_id,commit_oid,affected_areas,owner,tags,conflicts,reusable_complete) VALUES(?1,?2,?3,NULL,'[]','[]',1)",
         params![repo_id, update.oid, affected_areas],
     )?;
-    for ancestor in update.ancestors {
+    for parent in update.parents {
         tx.execute(
-            "INSERT OR IGNORE INTO commit_ancestry(repository_id,commit_oid,ancestor_oid) VALUES(?1,?2,?3)",
-            params![repo_id, update.oid, ancestor],
+            "INSERT OR IGNORE INTO commit_parents(repository_id,commit_oid,parent_oid) VALUES(?1,?2,?3)",
+            params![repo_id, update.oid, parent],
         )?;
     }
     for action in &update.response.journal.actions {
@@ -687,6 +782,7 @@ fn evaluate_update(
             } => {
                 let targets = metadata_targets(
                     tx,
+                    cache,
                     repo_id,
                     update.oid,
                     from_sha,
@@ -697,7 +793,9 @@ fn evaluate_update(
                     for operation in operations {
                         match operation.operator {
                             MetadataOperator::Set | MetadataOperator::Null => {
-                                assign_metadata_value(tx, repo_id, &target, update.oid, operation)?
+                                assign_metadata_value(
+                                    tx, cache, repo_id, &target, update.oid, operation,
+                                )?
                             }
                             MetadataOperator::Add => {
                                 add_metadata_value(tx, repo_id, &target, operation)?
@@ -720,11 +818,130 @@ fn evaluate_update(
 }
 
 impl Store {
+    /// Limit SQLite lock waits and long-running statements to the caller's
+    /// monotonic request budget. The progress hook is connection-local.
+    pub fn set_request_deadline(&self, deadline: Instant) -> anyhow::Result<()> {
+        self.set_request_deadline_and_cancellation(deadline, None)
+    }
+
+    pub fn set_request_deadline_and_cancellation(
+        &self,
+        deadline: Instant,
+        cancelled: Option<Arc<AtomicBool>>,
+    ) -> anyhow::Result<()> {
+        self.connection.busy_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(250)),
+        )?;
+        self.connection.progress_handler(
+            1000,
+            Some(move || {
+                Instant::now() >= deadline
+                    || cancelled
+                        .as_ref()
+                        .is_some_and(|token| token.load(Ordering::Acquire))
+            }),
+        );
+        Ok(())
+    }
+
+    pub fn open_readonly(path: &Path) -> anyhow::Result<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(Duration::from_millis(250))?;
+        connection.execute_batch("PRAGMA query_only=ON; PRAGMA foreign_keys=ON;")?;
+        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            version == SCHEMA_VERSION,
+            "unsupported zmem database schema {version}"
+        );
+        Ok(Self {
+            connection,
+            staging_protection: 0,
+        })
+    }
+
+    /// Open an initialized database for daemon-owned writes without rerunning
+    /// schema creation or migration on every job-state update.
+    pub fn open_writable_existing(path: &Path) -> anyhow::Result<Self> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        connection.busy_timeout(Duration::from_millis(250))?;
+        connection.execute_batch("PRAGMA foreign_keys=ON;")?;
+        let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        anyhow::ensure!(
+            version == SCHEMA_VERSION,
+            "unsupported zmem database schema {version}"
+        );
+        Ok(Self {
+            connection,
+            staging_protection: 0,
+        })
+    }
+
+    pub fn published_snapshot(
+        &mut self,
+        identity: &TrailIdentity,
+        include_invalid: bool,
+        max_entries: u64,
+        now: i64,
+        protect_recent_seconds: i64,
+    ) -> anyhow::Result<Option<PublishedSnapshot>> {
+        self.connection.execute_batch("BEGIN")?;
+        let result = (|| {
+            let prefix = format!("{}:", identity.key());
+            let trail = self.connection.query_row(
+                "SELECT id,repository_id,head_oid,attention_identity,extension_identity,protocol_version,schema_version,legacy,selected_commit_count,selected_node_count,source_time
+                 FROM trails WHERE repository_id=?1 AND head_oid=?2 AND extension_identity=?3 AND protocol_version=?4 AND schema_version=?5 AND legacy=0 AND substr(id,1,length(?6))=?6 ORDER BY id LIMIT 1",
+                params![identity.repository_id, identity.head_oid, identity.extension_identity, identity.protocol_version, identity.schema_version, prefix],
+                |row| Ok(TrailRecord {
+                    id: row.get(0)?, repository_id: row.get(1)?, head_oid: row.get(2)?,
+                    attention_identity: row.get(3)?, extension_identity: row.get(4)?,
+                    protocol_version: row.get(5)?, schema_version: row.get(6)?, legacy: row.get(7)?,
+                    selected_commit_count: row.get(8)?, selected_node_count: row.get(9)?, source_time: row.get(10)?,
+                }),
+            ).optional()?;
+            trail
+                .map(|trail| {
+                    Ok(PublishedSnapshot {
+                        entries: self.query_trail_entries(&trail.id, include_invalid)?,
+                        relationships: self.query_trail_relationships(&trail.id)?,
+                        diagnostics: self.query_trail_diagnostics(&trail.id)?,
+                        over_capacity: self
+                            .trail_cohorts(now, protect_recent_seconds)?
+                            .iter()
+                            .map(|row| row.entries)
+                            .sum::<u64>()
+                            + self.cohorts()?.iter().map(|row| row.entries).sum::<u64>()
+                            > max_entries,
+                        trail,
+                    })
+                })
+                .transpose()
+        })();
+        let finish =
+            self.connection
+                .execute_batch(if result.is_ok() { "COMMIT" } else { "ROLLBACK" });
+        finish?;
+        result
+    }
+
+    /// A cheap guard for the service's pre-identity job shortcut. Any trail
+    /// for this HEAD requires full compatibility validation before replying.
+    pub fn has_published_head(&self, repository: &str, head: &str) -> anyhow::Result<bool> {
+        let present: i64 = self.connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM trails t JOIN repositories r ON r.id=t.repository_id WHERE r.path=?1 AND t.head_oid=?2 AND t.legacy=0)",
+            params![repository, head],
+            |row| row.get(0),
+        )?;
+        Ok(present != 0)
+    }
+
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_millis(250))?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;")?;
         let mut existing_version: u32 =
             connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
@@ -772,6 +989,55 @@ impl Store {
             tx.commit()?;
             existing_version = 4;
         }
+        if existing_version == 4 {
+            let tx = connection.transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS commit_parents(
+                    repository_id INTEGER NOT NULL,
+                    commit_oid TEXT NOT NULL,
+                    parent_oid TEXT NOT NULL,
+                    PRIMARY KEY(repository_id,commit_oid,parent_oid),
+                    FOREIGN KEY(repository_id,commit_oid) REFERENCES commits(repository_id,oid) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS commit_parents_reverse ON commit_parents(repository_id,parent_oid);
+                CREATE TABLE IF NOT EXISTS raw_commit_facts(
+                    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                    commit_oid TEXT NOT NULL,
+                    fact TEXT NOT NULL,
+                    bytes INTEGER NOT NULL,
+                    PRIMARY KEY(repository_id,commit_oid)
+                );
+                CREATE TABLE IF NOT EXISTS raw_parent_edges(
+                    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                    commit_oid TEXT NOT NULL,
+                    parent_oid TEXT NOT NULL,
+                    bytes INTEGER NOT NULL,
+                    PRIMARY KEY(repository_id,commit_oid,parent_oid)
+                );
+                CREATE TABLE IF NOT EXISTS prefetch_jobs(
+                    repository_id INTEGER NOT NULL REFERENCES repositories(id) ON DELETE CASCADE,
+                    head_oid TEXT NOT NULL,
+                    ceiling INTEGER NOT NULL,
+                    completed_count INTEGER NOT NULL DEFAULT 0,
+                    checkpoint_oid TEXT,
+                    state TEXT NOT NULL,
+                    PRIMARY KEY(repository_id,head_oid)
+                );
+                CREATE TABLE IF NOT EXISTS index_jobs(
+                    id TEXT PRIMARY KEY,
+                    job_key TEXT NOT NULL UNIQUE,
+                    state TEXT NOT NULL,
+                    failure TEXT
+                );
+                PRAGMA user_version=5;",
+            )?;
+            tx.commit()?;
+            existing_version = 5;
+        }
+        if existing_version == 5 {
+            demand::migrate(&mut connection)?;
+            existing_version = 6;
+        }
         if existing_version != 0 && existing_version != SCHEMA_VERSION {
             anyhow::bail!("unsupported zmem database schema {existing_version}");
         }
@@ -786,7 +1052,11 @@ impl Store {
              CREATE TABLE IF NOT EXISTS inspections(commit_oid TEXT NOT NULL,parser_protocol INTEGER NOT NULL,annotation_count INTEGER NOT NULL,parser_diagnostics TEXT NOT NULL,PRIMARY KEY(commit_oid,parser_protocol));
              {TRAIL_SCHEMA}"),
         )?;
-        Ok(Self { connection })
+        connection.execute_batch(demand::SCHEMA)?;
+        Ok(Self {
+            connection,
+            staging_protection: 0,
+        })
     }
 
     pub fn register_repository(&mut self, path: &str, trusted: bool) -> anyhow::Result<i64> {
@@ -805,6 +1075,61 @@ impl Store {
         Ok(self
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))?)
+    }
+
+    pub fn recover_index_jobs(&mut self) -> anyhow::Result<Vec<PersistedIndexJob>> {
+        self.connection.execute(
+            "UPDATE index_jobs SET state='failed',failure='indexing was interrupted; hook execution may be uncertain' WHERE state IN ('queued','running')",
+            [],
+        )?;
+        let mut statement = self
+            .connection
+            .prepare("SELECT id,job_key,state,failure FROM index_jobs ORDER BY id")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(PersistedIndexJob {
+                    id: row.get(0)?,
+                    job_key: row.get(1)?,
+                    state: row.get(2)?,
+                    failure: row.get(3)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn insert_index_job(&mut self, id: &str, job_key: &str) -> anyhow::Result<()> {
+        self.connection.execute(
+            "INSERT INTO index_jobs(id,job_key,state,failure) VALUES(?1,?2,'queued',NULL)",
+            params![id, job_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_index_job_state(
+        &mut self,
+        id: &str,
+        state: &str,
+        failure: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE index_jobs SET state=?2,failure=?3 WHERE id=?1",
+            params![id, state, failure],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_index_job_key(&mut self, id: &str, job_key: &str) -> anyhow::Result<()> {
+        self.connection.execute(
+            "UPDATE index_jobs SET job_key=?2 WHERE id=?1",
+            params![id, job_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_index_job(&mut self, id: &str) -> anyhow::Result<()> {
+        self.connection
+            .execute("DELETE FROM index_jobs WHERE id=?1", [id])?;
+        Ok(())
     }
 
     pub fn trails(&self, repo_id: i64) -> anyhow::Result<Vec<TrailRecord>> {
@@ -860,7 +1185,7 @@ impl Store {
         let TrailPublication {
             trail,
             commits,
-            ancestors,
+            parents,
             entries,
             relationships,
             diagnostics,
@@ -884,6 +1209,19 @@ impl Store {
             ],
         )?;
         for (position, commit) in commits.iter().enumerate() {
+            let encoded = serde_json::to_string(commit)?;
+            tx.execute("INSERT OR IGNORE INTO raw_commit_facts(repository_id,commit_oid,fact,bytes) VALUES(?1,?2,?3,?4)",params![trail.repository_id,commit.sha,encoded,encoded.len()])?;
+            for parent in parents.get(&commit.sha).into_iter().flatten() {
+                tx.execute(
+                    "INSERT OR IGNORE INTO raw_parent_edges VALUES(?1,?2,?3,?4)",
+                    params![
+                        trail.repository_id,
+                        commit.sha,
+                        parent,
+                        commit.sha.len() + parent.len() + 32
+                    ],
+                )?;
+            }
             tx.execute(
                 "INSERT OR IGNORE INTO commits(repository_id,oid,commit_time,message) VALUES(?1,?2,?3,?4)",
                 params![trail.repository_id, commit.sha, commit.commit_time, commit.message],
@@ -906,10 +1244,10 @@ impl Store {
                 "INSERT OR IGNORE INTO commit_metadata(repository_id,commit_oid,affected_areas,owner,tags,conflicts,reusable_complete) VALUES(?1,?2,?3,NULL,'[]','[]',1)",
                 params![trail.repository_id, commit.sha, areas],
             )?;
-            for ancestor in ancestors.get(&commit.sha).into_iter().flatten() {
+            for parent in parents.get(&commit.sha).into_iter().flatten() {
                 tx.execute(
-                    "INSERT OR IGNORE INTO commit_ancestry(repository_id,commit_oid,ancestor_oid) VALUES(?1,?2,?3)",
-                    params![trail.repository_id, commit.sha, ancestor],
+                    "INSERT OR IGNORE INTO commit_parents(repository_id,commit_oid,parent_oid) VALUES(?1,?2,?3)",
+                    params![trail.repository_id, commit.sha, parent],
                 )?;
             }
             tx.execute(
@@ -995,6 +1333,13 @@ impl Store {
                 params![trail.repository_id, sha, message, trail.id],
             )?;
         }
+        demand::record_use(
+            &tx,
+            &trail.id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs(),
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1014,6 +1359,237 @@ impl Store {
             .optional()?
             .map(|value| Ok(serde_json::from_str(&value)?))
             .transpose()
+    }
+
+    pub fn raw_commit(&self, repo_id: i64, oid: &str) -> anyhow::Result<Option<GitCommit>> {
+        self.connection
+            .query_row(
+                "SELECT fact FROM raw_commit_facts WHERE repository_id=?1 AND commit_oid=?2",
+                params![repo_id, oid],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|encoded| Ok(serde_json::from_str(&encoded)?))
+            .transpose()
+    }
+
+    pub fn raw_parents(&self, repo_id: i64, oid: &str) -> anyhow::Result<Vec<String>> {
+        let mut statement = self.connection.prepare(
+            "SELECT parent_oid FROM raw_parent_edges WHERE repository_id=?1 AND commit_oid=?2 ORDER BY parent_oid",
+        )?;
+        Ok(statement
+            .query_map(params![repo_id, oid], |row| row.get(0))?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn prefetch_checkpoint(
+        &self,
+        repo_id: i64,
+        head: &str,
+    ) -> anyhow::Result<Option<(usize, Option<String>)>> {
+        self.connection.query_row(
+            "SELECT completed_count,checkpoint_oid FROM prefetch_jobs WHERE repository_id=?1 AND head_oid=?2",
+            params![repo_id, head],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn pending_prefetch_jobs(&self) -> anyhow::Result<Vec<(PathBuf, String)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT r.path,p.head_oid FROM prefetch_jobs p JOIN repositories r ON r.id=p.repository_id
+             WHERE p.state IN ('running','paused_shutdown','paused_capacity') ORDER BY p.rowid LIMIT 32",
+        )?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok((PathBuf::from(row.get::<_, String>(0)?), row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    fn reclaim_unpinned_raw(tx: &Transaction<'_>, protection: i64) -> anyhow::Result<()> {
+        demand::reclaim(tx, protection)
+    }
+
+    pub fn set_staging_protection(&mut self, seconds: i64) {
+        self.staging_protection = seconds;
+    }
+
+    fn bound_prefetch_pins(
+        tx: &Transaction<'_>,
+        preserve: Option<(i64, &str)>,
+        protection: i64,
+    ) -> anyhow::Result<()> {
+        let active: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM prefetch_jobs WHERE state IN ('running','paused_shutdown','paused_capacity')",
+            [],
+            |row| row.get(0),
+        )?;
+        if active > 32 {
+            tx.execute(
+                "UPDATE prefetch_jobs SET state='obsolete' WHERE rowid IN (
+                    SELECT rowid FROM prefetch_jobs
+                    WHERE state IN ('running','paused_shutdown','paused_capacity')
+                      AND (?1 IS NULL OR NOT (repository_id=?1 AND head_oid=?2))
+                    ORDER BY rowid LIMIT ?3
+                 )",
+                params![
+                    preserve.map(|(repo_id, _)| repo_id),
+                    preserve.map(|(_, head)| head),
+                    active - 32
+                ],
+            )?;
+            Self::reclaim_unpinned_raw(tx, protection)?;
+        }
+        Ok(())
+    }
+
+    pub fn reconcile_prefetch_staging(&mut self) -> anyhow::Result<()> {
+        let tx = self.connection.transaction()?;
+        Self::bound_prefetch_pins(&tx, None, self.staging_protection)?;
+        Self::reclaim_unpinned_raw(&tx, self.staging_protection)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn record_prefetch_batch(
+        &mut self,
+        repo_id: i64,
+        head: &str,
+        ceiling: usize,
+        completed_count: usize,
+        batch: RawCommitBatch<'_>,
+        staging_quota_bytes: u64,
+    ) -> anyhow::Result<bool> {
+        let RawCommitBatch { facts, parents } = batch;
+        let mut attempted_reclaims = 0;
+        loop {
+            let tx = self.connection.transaction()?;
+            let used: u64 = tx.query_row(
+            "SELECT COALESCE((SELECT SUM(r.bytes) FROM raw_commit_facts r
+                 WHERE NOT EXISTS(SELECT 1 FROM trail_membership m WHERE m.repository_id=r.repository_id AND m.commit_oid=r.commit_oid)),0)
+               + COALESCE((SELECT SUM(e.bytes) FROM raw_parent_edges e
+                 WHERE NOT EXISTS(SELECT 1 FROM trail_membership m WHERE m.repository_id=e.repository_id AND m.commit_oid=e.commit_oid)),0)",
+            [],
+            |row| row.get(0),
+        )?;
+            let mut additional = 0_u64;
+            let mut encoded = Vec::new();
+            let mut new_edges = Vec::new();
+            for fact in facts {
+                let retained: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM trail_membership WHERE repository_id=?1 AND commit_oid=?2)",
+                params![repo_id, fact.sha], |row| row.get(0),
+            )?;
+                let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM raw_commit_facts WHERE repository_id=?1 AND commit_oid=?2)",
+                params![repo_id, fact.sha], |row| row.get(0),
+            )?;
+                if !exists {
+                    let json = serde_json::to_string(fact)?;
+                    if !retained {
+                        additional = additional.saturating_add(json.len() as u64);
+                    }
+                    encoded.push((fact.sha.as_str(), json, retained));
+                }
+                for parent in parents.get(&fact.sha).into_iter().flatten() {
+                    let exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM raw_parent_edges WHERE repository_id=?1 AND commit_oid=?2 AND parent_oid=?3)",
+                    params![repo_id, fact.sha, parent], |row| row.get(0),
+                )?;
+                    if !exists {
+                        let bytes = fact.sha.len() + parent.len() + 32;
+                        if !retained {
+                            additional = additional.saturating_add(bytes as u64);
+                        }
+                        new_edges.push((fact.sha.as_str(), parent.as_str(), bytes));
+                    }
+                }
+            }
+            if used.saturating_add(additional) > staging_quota_bytes {
+                if attempted_reclaims == 0 {
+                    Self::reclaim_unpinned_raw(&tx, self.staging_protection)?;
+                    tx.commit()?;
+                    attempted_reclaims += 1;
+                    continue;
+                }
+                if attempted_reclaims < 257
+                    && demand::evict_lru(&tx, repo_id, head, self.staging_protection)?
+                {
+                    tx.commit()?;
+                    attempted_reclaims += 1;
+                    continue;
+                }
+                tx.execute(
+                "INSERT INTO prefetch_jobs(repository_id,head_oid,ceiling,completed_count,checkpoint_oid,state) VALUES(?1,?2,?3,?4,?5,'paused_capacity')
+                 ON CONFLICT(repository_id,head_oid) DO UPDATE SET state='paused_capacity'",
+                params![repo_id, head, ceiling, completed_count.saturating_sub(facts.len()), Option::<&str>::None],
+            )?;
+                Self::bound_prefetch_pins(&tx, Some((repo_id, head)), self.staging_protection)?;
+                tx.commit()?;
+                return Ok(false);
+            }
+            for (oid, json, retained) in encoded {
+                let bytes = json.len();
+                tx.execute(
+                "INSERT OR IGNORE INTO raw_commit_facts(repository_id,commit_oid,fact,bytes) VALUES(?1,?2,?3,?4)",
+                params![repo_id, oid, json, bytes],
+            )?;
+                if !retained {
+                    let total_bytes = bytes
+                        + new_edges
+                            .iter()
+                            .filter(|(child, _, _)| *child == oid)
+                            .map(|(_, _, bytes)| *bytes)
+                            .sum::<usize>();
+                    tx.execute("INSERT OR IGNORE INTO speculative_usage(repository_id,commit_oid,bytes) VALUES(?1,?2,?3)",params![repo_id,oid,total_bytes])?;
+                    tx.execute("UPDATE prefetch_metrics SET produced_facts=produced_facts+1,produced_bytes=produced_bytes+?1 WHERE id=1",[total_bytes])?;
+                }
+            }
+            for (oid, parent, bytes) in new_edges {
+                tx.execute(
+                "INSERT OR IGNORE INTO raw_parent_edges(repository_id,commit_oid,parent_oid,bytes) VALUES(?1,?2,?3,?4)",
+                params![repo_id, oid, parent, bytes],
+            )?;
+            }
+            tx.execute(
+            "INSERT INTO prefetch_jobs(repository_id,head_oid,ceiling,completed_count,checkpoint_oid,state) VALUES(?1,?2,?3,?4,?5,'running')
+             ON CONFLICT(repository_id,head_oid) DO UPDATE SET ceiling=excluded.ceiling,completed_count=excluded.completed_count,checkpoint_oid=excluded.checkpoint_oid,state='running'",
+            params![repo_id, head, ceiling, completed_count, facts.last().map(|fact| fact.sha.as_str())],
+        )?;
+            tx.execute("INSERT OR IGNORE INTO speculative_cohorts(repository_id,head_oid,created) VALUES(?1,?2,unixepoch())",params![repo_id,head])?;
+            Self::bound_prefetch_pins(&tx, Some((repo_id, head)), self.staging_protection)?;
+            tx.commit()?;
+            return Ok(true);
+        }
+    }
+
+    pub fn set_prefetch_state(
+        &mut self,
+        repo_id: i64,
+        head: &str,
+        state: &str,
+    ) -> anyhow::Result<()> {
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "UPDATE prefetch_jobs SET state=?3 WHERE repository_id=?1 AND head_oid=?2",
+            params![repo_id, head, state],
+        )?;
+        if matches!(state, "ready" | "obsolete" | "paused_demand") {
+            tx.execute(
+                "DELETE FROM prefetch_jobs WHERE rowid IN (
+                    SELECT p.rowid FROM prefetch_jobs p LEFT JOIN speculative_cohorts c USING(repository_id,head_oid)
+                    WHERE p.state IN ('ready','obsolete','paused_demand')
+                    ORDER BY c.last_demand IS NOT NULL,c.last_demand,COALESCE(c.created,0),p.repository_id,p.head_oid
+                    LIMIT MAX((SELECT COUNT(*) FROM prefetch_jobs WHERE state IN ('ready','obsolete','paused_demand')) - 256, 0)
+                 )",
+                [],
+            )?;
+            Self::reclaim_unpinned_raw(&tx, self.staging_protection)?;
+        } else if matches!(state, "running" | "paused_shutdown" | "paused_capacity") {
+            Self::bound_prefetch_pins(&tx, Some((repo_id, head)), self.staging_protection)?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_ref_alias(
@@ -1201,8 +1777,9 @@ impl Store {
             tx.execute("DELETE FROM anchors WHERE repository_id=?1", [repo_id])?;
             tx.execute("DELETE FROM commits WHERE repository_id=?1", [repo_id])?;
         }
+        let mut cache = ReachabilityCache::default();
         for update in updates {
-            evaluate_update(&tx, repo_id, update, true)?;
+            evaluate_update(&tx, &mut cache, repo_id, update, true)?;
         }
         tx.commit()?;
         Ok(())
@@ -1217,8 +1794,9 @@ impl Store {
         let tx = self.connection.transaction()?;
         tx.execute("DELETE FROM anchors WHERE repository_id=?1", [repo_id])?;
         tx.execute("DELETE FROM commits WHERE repository_id=?1", [repo_id])?;
+        let mut cache = ReachabilityCache::default();
         for update in updates {
-            evaluate_update(&tx, repo_id, update, false)?;
+            evaluate_update(&tx, &mut cache, repo_id, update, false)?;
         }
         tx.execute(
             "INSERT INTO anchors(repository_id,head,schema_version,extension_hash,attention_identity) VALUES(?1,?2,?3,?4,?5)",
@@ -1240,7 +1818,13 @@ impl Store {
         update: &CommitUpdate<'_>,
     ) -> anyhow::Result<PreviewResult> {
         let tx = self.connection.transaction()?;
-        let result = evaluate_update(&tx, repo_id, update, false)?;
+        let result = evaluate_update(
+            &tx,
+            &mut ReachabilityCache::default(),
+            repo_id,
+            update,
+            false,
+        )?;
         tx.rollback()?;
         Ok(result)
     }
@@ -1364,5 +1948,39 @@ impl Store {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::*;
+
+    #[test]
+    fn expired_request_interrupts_sqlite_work_without_poisoning_connection() {
+        let store = Store {
+            connection: Connection::open_in_memory().unwrap(),
+            staging_protection: 0,
+        };
+        store
+            .set_request_deadline(Instant::now() - Duration::from_millis(1))
+            .unwrap();
+        let result: rusqlite::Result<i64> = store.connection.query_row(
+            "WITH RECURSIVE numbers(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM numbers WHERE n<1000000) SELECT SUM(n) FROM numbers",
+            [],
+            |row| row.get(0),
+        );
+        assert!(matches!(
+            result,
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::OperationInterrupted
+        ));
+        store.connection.progress_handler(0, None::<fn() -> bool>);
+        assert_eq!(
+            store
+                .connection
+                .query_row("SELECT 1", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 }

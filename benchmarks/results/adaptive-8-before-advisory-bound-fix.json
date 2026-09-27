@@ -1,0 +1,94 @@
+{
+  "binary": "C:\\Users\\ZackaryW\\Desktop\\+workplace\\zmem-cache\\target\\adaptive\\debug\\zmem-svc.exe",
+  "sha256": "41c1fb82cad8f24b3d3168dc8817ad7b2aa5d14a21ab07019ef0931f49e7af88",
+  "identity": {
+    "release_version": "1.2.0",
+    "protocol_version": 5,
+    "schema_version": 6
+  },
+  "fixture": "3 x 1600 merged commits, decision every 80, 450000-byte staging quota; controlled persisted promotion; installed host; concurrent deep check and wider demand",
+  "utilization_audit": false,
+  "runs": [
+    {
+      "repetition": 1,
+      "clients": 8,
+      "samples": 30,
+      "warm_ms": {
+        "p50": 812.8,
+        "p95": 879.2,
+        "p99": 907.8,
+        "stdev": 227.9
+      },
+      "cold_demand_ms": [
+        10594.9,
+        10081.6,
+        18999.9
+      ],
+      "wider_demand_ms": 12120.0,
+      "unused_bytes": 0,
+      "metrics": {
+        "id": 1,
+        "produced_facts": 500,
+        "produced_bytes": 135962,
+        "reused_facts": 500,
+        "reused_bytes": 135962,
+        "unused_evicted_bytes": 0,
+        "reclamation_generation": 0
+      }
+    },
+    {
+      "repetition": 2,
+      "clients": 8,
+      "samples": 30,
+      "warm_ms": {
+        "p50": 833.5,
+        "p95": 866.7,
+        "p99": 891.5,
+        "stdev": 194.3
+      },
+      "cold_demand_ms": [
+        10406.5,
+        9949.0,
+        19806.6
+      ],
+      "wider_demand_ms": 12623.3,
+      "unused_bytes": 0,
+      "metrics": {
+        "id": 1,
+        "produced_facts": 500,
+        "produced_bytes": 135962,
+        "reused_facts": 500,
+        "reused_bytes": 135962,
+        "unused_evicted_bytes": 0,
+        "reclamation_generation": 0
+      }
+    },
+    {
+      "repetition": 3,
+      "clients": 8,
+      "samples": 30,
+      "warm_ms": {
+        "p50": 831.8,
+        "p95": 881.1,
+        "p99": 914.2,
+        "stdev": 201.4
+      },
+      "cold_demand_ms": [
+        10685.9,
+        10122.4,
+        19987.3
+      ],
+      "wider_demand_ms": 12472.6,
+      "unused_bytes": 0,
+      "metrics": {
+        "id": 1,
+        "produced_facts": 500,
+        "produced_bytes": 135962,
+        "reused_facts": 500,
+        "reused_bytes": 135962,
+        "unused_evicted_bytes": 0,
+        "reclamation_generation": 0
+      }
+    }
+  ]
+}

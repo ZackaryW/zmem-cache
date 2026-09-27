@@ -20,6 +20,38 @@ fn trail_identity_changes_with_every_compatibility_input() {
 }
 
 #[test]
+fn route_identity_follows_named_refs_but_keeps_detached_expressions_separate() {
+    let repo = TestRepo::new();
+    let git = GitRepo::open(&repo.0).unwrap();
+    let head = git.head().unwrap();
+    for alias in ["HEAD", "main", "refs/heads/main"] {
+        assert_eq!(
+            git.resolve_observed(alias, &head).unwrap().route,
+            "refs/heads/main"
+        );
+    }
+    assert_eq!(
+        git.resolve_observed("feature", &head).unwrap().route,
+        "refs/heads/feature"
+    );
+    assert_eq!(
+        git.resolve_observed(&head, &head).unwrap().route,
+        format!("oid:{head}")
+    );
+    repo.advance_feature();
+    let advanced = git.resolve("feature").unwrap();
+    assert_eq!(
+        git.resolve_observed("feature", &advanced).unwrap().route,
+        "refs/heads/feature"
+    );
+    run(&repo.0, &["checkout", "-q", "--detach", &head]);
+    assert_eq!(
+        git.resolve_observed("HEAD", &head).unwrap().route,
+        format!("oid:{head}")
+    );
+}
+
+#[test]
 fn live_resolution_rejects_a_stale_observation_without_checkout() {
     let repo = TestRepo::new();
     let git = GitRepo::open(&repo.0).unwrap();
@@ -44,7 +76,7 @@ impl TestRepo {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&path).unwrap();
-        run(&path, &["init", "-q"]);
+        run(&path, &["init", "-q", "-b", "main"]);
         run(&path, &["config", "user.name", "Test"]);
         run(&path, &["config", "user.email", "test@example.com"]);
         std::fs::write(path.join("file"), "one").unwrap();

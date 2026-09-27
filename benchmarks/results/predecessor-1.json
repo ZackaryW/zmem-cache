@@ -1,0 +1,69 @@
+{
+  "binary": "C:\\Users\\ZackaryW\\Desktop\\+workplace\\zmem-cache\\target\\corrected-predecessor\\zmem-svc.exe",
+  "sha256": "83b059e750400e27f53846700a852ced8610a3c48122fc0f9fe37361c40c5f2e",
+  "identity": {
+    "release_version": "1.2.0",
+    "protocol_version": 5,
+    "schema_version": 5
+  },
+  "fixture": "3 x 1600 merged commits, decision every 80, 450000-byte staging quota; controlled persisted promotion; installed host; concurrent deep check",
+  "runs": [
+    {
+      "repetition": 1,
+      "clients": 1,
+      "samples": 30,
+      "warm_ms": {
+        "p50": 220.8,
+        "p95": 244.0,
+        "p99": 245.6,
+        "stdev": 28.1
+      },
+      "cold_demand_ms": [
+        10620.8,
+        10059.2,
+        19744.1
+      ],
+      "wider_demand_ms": 13618.2,
+      "unused_bytes": 26932,
+      "metrics": null
+    },
+    {
+      "repetition": 2,
+      "clients": 1,
+      "samples": 30,
+      "warm_ms": {
+        "p50": 217.2,
+        "p95": 234.7,
+        "p99": 242.9,
+        "stdev": 29.7
+      },
+      "cold_demand_ms": [
+        10489.7,
+        10035.4,
+        20561.4
+      ],
+      "wider_demand_ms": 13043.3,
+      "unused_bytes": 26932,
+      "metrics": null
+    },
+    {
+      "repetition": 3,
+      "clients": 1,
+      "samples": 30,
+      "warm_ms": {
+        "p50": 217.1,
+        "p95": 249.1,
+        "p99": 249.4,
+        "stdev": 29.1
+      },
+      "cold_demand_ms": [
+        10158.6,
+        9799.4,
+        19224.8
+      ],
+      "wider_demand_ms": 12997.3,
+      "unused_bytes": 26932,
+      "metrics": null
+    }
+  ]
+}

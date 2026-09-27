@@ -1,0 +1,38 @@
+{
+  "binary": "C:\\Users\\ZackaryW\\Desktop\\+workplace\\zmem-cache\\target\\corrected-predecessor\\zmem-svc.exe",
+  "sha256": "83b059e750400e27f53846700a852ced8610a3c48122fc0f9fe37361c40c5f2e",
+  "identity": {
+    "release_version": "1.2.0",
+    "protocol_version": 5,
+    "schema_version": 5
+  },
+  "fixture": "3 x 1600 merged commits, decision every 80, 450000-byte staging quota; controlled persisted promotion; installed host; concurrent deep check and wider demand",
+  "utilization_audit": true,
+  "runs": [
+    {
+      "repetition": 1,
+      "clients": 1,
+      "samples": 1,
+      "warm_ms": {
+        "p50": 114.5,
+        "p95": 114.5,
+        "p99": 114.5,
+        "stdev": 0.0
+      },
+      "cold_demand_ms": [
+        11117.8,
+        10290.5,
+        20818.7
+      ],
+      "wider_demand_ms": 13210.5,
+      "unused_bytes": 26932,
+      "metrics": null,
+      "utilization_audit": {
+        "produced_facts": 2800,
+        "produced_bytes": 760810,
+        "reused_facts": 500,
+        "reused_bytes": 135962
+      }
+    }
+  ]
+}

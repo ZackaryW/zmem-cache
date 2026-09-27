@@ -1,14 +1,18 @@
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use zmem_store::Store;
+
+static NEXT_DB: AtomicU64 = AtomicU64::new(0);
 
 struct TestDb(PathBuf);
 
 impl TestDb {
     fn new() -> Self {
         Self(std::env::temp_dir().join(format!(
-            "zmem-store-v4-{}-{}.db",
+            "zmem-store-v4-{}-{}-{}.db",
             std::process::id(),
+            NEXT_DB.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         )))
     }
@@ -82,7 +86,7 @@ fn schema_three_projection_becomes_a_global_legacy_trail_without_replay() {
     drop(connection);
 
     let store = Store::open(db.path()).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 6);
     assert_eq!(store.repository("repo").unwrap(), Some((1, true)));
     let trails = store.trails(1).unwrap();
     assert_eq!(trails.len(), 1);
@@ -108,4 +112,83 @@ fn failed_schema_three_migration_rolls_back_the_version() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(version, 3);
+}
+
+fn create_schema_four_with_selection(path: &Path) -> String {
+    let mut store = Store::open(path).unwrap();
+    let repo_id = store.register_repository("repo", false).unwrap();
+    drop(store);
+    let oid = "b".repeat(40);
+    let connection = Connection::open(path).unwrap();
+    connection.execute(
+        "INSERT INTO trails(id,repository_id,head_oid,attention_identity,extension_identity,protocol_version,schema_version,selected_commit_count,selected_node_count)
+         VALUES('selected',?1,?2,'view:complete','extension',4,4,7,3)",
+        rusqlite::params![repo_id, oid],
+    ).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE index_jobs;
+         DROP TABLE prefetch_jobs;
+         DROP TABLE raw_parent_edges;
+         DROP TABLE raw_commit_facts;
+         DROP TABLE commit_parents;
+         PRAGMA user_version=4;",
+        )
+        .unwrap();
+    oid
+}
+
+#[test]
+fn schema_four_migration_keeps_published_selection_metadata() {
+    let db = TestDb::new();
+    let oid = create_schema_four_with_selection(db.path());
+    let store = Store::open(db.path()).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 6);
+    let trail = &store.trails(1).unwrap()[0];
+    assert_eq!(trail.head_oid, oid);
+    assert_eq!(trail.attention_identity, "view:complete");
+    assert_eq!(trail.selected_commit_count, 7);
+    assert_eq!(trail.selected_node_count, 3);
+    let connection = Connection::open(db.path()).unwrap();
+    for table in [
+        "commit_parents",
+        "raw_commit_facts",
+        "raw_parent_edges",
+        "prefetch_jobs",
+        "index_jobs",
+    ] {
+        let exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "missing {table}");
+    }
+}
+
+#[test]
+fn failed_schema_four_migration_keeps_previous_version() {
+    let db = TestDb::new();
+    create_schema_four_with_selection(db.path());
+    let connection = Connection::open(db.path()).unwrap();
+    connection.execute_batch(
+        "CREATE VIEW commit_parents AS SELECT 1 AS repository_id, 'a' AS commit_oid, 'b' AS parent_oid;"
+    ).unwrap();
+    drop(connection);
+    assert!(Store::open(db.path()).is_err());
+    let connection = Connection::open(db.path()).unwrap();
+    let version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 4);
+    let table_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='raw_commit_facts'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(table_count, 0);
 }

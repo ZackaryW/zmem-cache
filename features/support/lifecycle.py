@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tempfile
+import time
 import venv
 from pathlib import Path
 
@@ -27,8 +29,10 @@ def before_scenario(context, _scenario) -> None:
     scripts = "Scripts" if os.name == "nt" else "bin"
     suffix = ".exe" if os.name == "nt" else ""
     context.env["ZMEM_EXTENSION_HOST"] = str((ZMEM_ROOT / ".venv" / scripts / f"zmem-extension-host{suffix}").resolve())
-    context.svc = ROOT / "target" / "debug" / f"zmem-svc{suffix}"
+    context.svc = Path(os.environ.get("ZMEM_TEST_SERVICE", ROOT / "target" / "debug" / f"zmem-svc{suffix}"))
     context.commit_count = 0
+    context.service_pids = set()
+    context.service_paths = {str(context.svc.resolve()).casefold()}
 
 
 def assemble_test_runtime(context) -> None:
@@ -54,7 +58,41 @@ def after_scenario(context, _scenario) -> None:
             timeout=5,
             check=False,
         )
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline and any(_process_alive(context, pid) for pid in context.service_pids):
+        time.sleep(0.05)
+    for pid in context.service_pids:
+        if _process_alive(context, pid):
+            os.kill(pid, signal.SIGTERM)
     shutil.rmtree(context.temp_root, ignore_errors=True)
+
+
+def _process_alive(context, pid: int) -> bool:
+    if os.name == "nt":
+        import ctypes
+
+        kernel = ctypes.windll.kernel32
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        image = ctypes.create_unicode_buffer(32768)
+        image_length = ctypes.c_ulong(len(image))
+        try:
+            return (
+                bool(kernel.GetExitCodeProcess(handle, ctypes.byref(code)))
+                and code.value == 259
+                and bool(kernel.QueryFullProcessImageNameW(handle, 0, image, ctypes.byref(image_length)))
+                and image.value.casefold() in context.service_paths
+            )
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    executable = Path(f"/proc/{pid}/exe")
+    return not executable.exists() or str(executable.resolve()).casefold() in context.service_paths
 
 
 def init_repo(context) -> None:
@@ -85,6 +123,7 @@ def commit(context, body: str, *, subject: str = "feat(core): memory", timestamp
 
 
 def run_svc(context, *args: str, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
+    context.service_paths.add(str(context.svc.resolve()).casefold())
     context.completed = subprocess.run(
         [context.svc, *args],
         env=context.env,
@@ -95,12 +134,36 @@ def run_svc(context, *args: str, input_text: str | None = None) -> subprocess.Co
         check=False,
     )
     context.payload = None
+    state_file = context.home / "service.json"
+    if state_file.exists():
+        try:
+            context.service_pids.add(int(json.loads(state_file.read_text())["pid"]))
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            pass
     if context.completed.stdout.strip():
         try:
             context.payload = json.loads(context.completed.stdout)
         except json.JSONDecodeError:
             pass
     return context.completed
+
+
+def query_until_ready(context, *args: str) -> subprocess.CompletedProcess[str]:
+    deadline = time.monotonic() + 30
+    while True:
+        result = run_svc(context, *args)
+        if result.returncode == 0:
+            return result
+        try:
+            failure = json.loads(result.stderr)
+        except json.JSONDecodeError:
+            return result
+        if failure.get("code") != "not_ready":
+            return result
+        job_id = failure["job_id"]
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"indexing job {job_id} did not finish: {failure}")
+        time.sleep(0.05)
 
 
 def database(context) -> sqlite3.Connection:

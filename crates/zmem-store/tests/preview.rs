@@ -77,7 +77,7 @@ fn seeded_store() -> (TestDb, Store, i64, HostResponse, Anchor) {
                 response: &base,
                 anchor: &base_anchor,
                 affected_areas: None,
-                ancestors: &[],
+                parents: &[],
                 range_complete: true,
             }],
             false,
@@ -104,7 +104,7 @@ fn cancellation_preview_reports_projection_and_rolls_back() {
                 response: &preview,
                 anchor: &virtual_anchor,
                 affected_areas: None,
-                ancestors: &[],
+                parents: &[],
                 range_complete: true,
             },
         )
@@ -139,7 +139,7 @@ fn decay_after_cancel_is_reported_as_no_op() {
                 response: &cancel,
                 anchor: &cancel_anchor,
                 affected_areas: None,
-                ancestors: &[],
+                parents: &[],
                 range_complete: true,
             }],
             false,
@@ -161,7 +161,7 @@ fn decay_after_cancel_is_reported_as_no_op() {
                 response: &decay,
                 anchor: &virtual_anchor,
                 affected_areas: None,
-                ancestors: &[],
+                parents: &[],
                 range_complete: true,
             },
         )
@@ -197,7 +197,7 @@ fn ordered_preview_effects_share_projected_state() {
                 response: &actions,
                 anchor: &virtual_anchor,
                 affected_areas: None,
-                ancestors: &[],
+                parents: &[],
                 range_complete: true,
             },
         )
@@ -226,7 +226,7 @@ fn unresolved_preview_effect_is_rejected_with_a_diagnostic() {
                 response: &actions,
                 anchor: &virtual_anchor,
                 affected_areas: None,
-                ancestors: &[],
+                parents: &[],
                 range_complete: true,
             },
         )
